@@ -7,13 +7,10 @@ from configs.datasets_config import get_dataset_info
 import pickle
 import os
 
-bond_dict = [None, Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE, Chem.rdchem.BondType.TRIPLE, Chem.rdchem.BondType.AROMATIC]
-allowed_bonds = {'H': 1, 'C': 4, 'N': 3, 'O': 2, 'F': 1, 'B': 3, 'Al': 3, 'Si': 4, 'P': [3, 5],
-                 'S': 4, 'Cl': 1, 'As': 3, 'Br': 1, 'I': 1, 'Hg': [1, 2], 'Bi': [3, 5], 'Se': [2, 4, 6]}
-
 
 def compute_qm9_smiles(dataset_name, remove_h):
     '''
+
     :param dataset_name: qm9 or qm9_second_half
     :return:
     '''
@@ -144,32 +141,32 @@ def mol2smiles(mol):
     return Chem.MolToSmiles(mol)
 
 
-# def build_molecule(positions, atom_types, edge_types, dataset_info):
+# def build_molecule(atom_types, edge_types, dataset_info):
 #     atom_decoder = dataset_info["atom_decoder"]
-#     X, A, E = build_xae_molecule(positions, atom_types, dataset_info)
 #     mol = Chem.RWMol()
-#     for atom in X:
+#     for atom in atom_types:
 #         a = Chem.Atom(atom_decoder[atom.item()])
 #         mol.AddAtom(a)
 
-#     all_bonds = torch.nonzero(A)
-#     for bond in all_bonds:
-#         mol.AddBond(bond[0].item(), bond[1].item(), bond_dict[E[bond[0], bond[1]].item()])
+#     edge_types = torch.triu(edge_types)
+#     all_bonds = torch.nonzero(edge_types)
+#     for i, bond in enumerate(all_bonds):
+#         if bond[0].item() != bond[1].item():
+#             mol.AddBond(bond[0].item(), bond[1].item(), bond_dict[edge_types[bond[0], bond[1]].item()])
+
 #     return mol
 
-
-def build_molecule(positions, atom_types, edge_types, dataset_info):
+def build_molecule(atom_types, edge_types, positions, dataset_info):
     atom_decoder = dataset_info["atom_decoder"]
+    X, A, E = build_xae_molecule(positions, atom_types, dataset_info)
     mol = Chem.RWMol()
-    for atom in atom_types:
+    for atom in X:
         a = Chem.Atom(atom_decoder[atom.item()])
         mol.AddAtom(a)
 
-    edge_types = torch.triu(edge_types)
-    all_bonds = torch.nonzero(edge_types)
-    for i, bond in enumerate(all_bonds):
-        if bond[0].item() != bond[1].item():
-            mol.AddBond(bond[0].item(), bond[1].item(), bond_dict[edge_types[bond[0], bond[1]].item()])
+    all_bonds = torch.nonzero(A)
+    for bond in all_bonds:
+        mol.AddBond(bond[0].item(), bond[1].item(), bond_dict[E[bond[0], bond[1]].item()])
     return mol
 
 
@@ -212,3 +209,4 @@ if __name__ == '__main__':
     block_mol = Chem.MolToMolBlock(chem_mol)
     print("Block mol:")
     print(block_mol)
+

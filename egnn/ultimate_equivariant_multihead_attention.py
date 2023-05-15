@@ -8,6 +8,93 @@ import torch_geometric
 from torch_scatter import scatter
 
 
+def init_params(module, n_layers):
+    if isinstance(module, nn.Linear):
+        module.weight.data.normal_(mean=0.0, std=0.02 / math.sqrt(n_layers))
+        if module.bias is not None:
+            module.bias.data.zero_()
+            
+    if isinstance(module, nn.Embedding):
+        module.weight.data.normal_(mean=0.0, std=0.02)
+        
+    if isinstance(module, nn.LayerNorm):
+        module.reset_parameters()
+       
+    
+@torch.jit.script
+def gaussian(x, mean, std):
+    pi = math.pi
+    a = (2*pi) ** 0.5
+    return torch.exp(-0.5 * (((x - mean) / std) ** 2)) / (a * std)
+
+
+class GaussianLayer(nn.Module):
+    def __init__(self, K=128, edge_types=512*3):
+        super().__init__()
+        self.K = K
+        self.means = nn.Embedding(1, K)
+        self.stds = nn.Embedding(1, K)
+        self.mul = nn.Embedding(edge_types, 1, padding_idx=0)
+        self.bias = nn.Embedding(edge_types, 1, padding_idx=0)
+        nn.init.uniform_(self.means.weight, 0, 3)
+        nn.init.uniform_(self.stds.weight, 0, 3)
+        nn.init.constant_(self.bias.weight, 0)
+        nn.init.constant_(self.mul.weight, 1)
+
+    def forward(self, x, edge_types):
+        mul = self.mul(edge_types).sum(dim=-2)
+        bias = self.bias(edge_types).sum(dim=-2)
+        x = mul.unsqueeze(-1) * x.unsqueeze(-1) + bias.unsqueeze(-1)
+        x = x.expand(-1, -1, -1, self.K)
+        mean = self.means.weight.float().view(-1)
+        std = self.stds.weight.float().view(-1).abs() + 1e-2
+        return gaussian(x.float(), mean, std).type_as(self.means.weight)
+
+    
+    
+class ExponentialLayer(nn.Module):
+    def __init__(self, cutoff_lower=0.0, cutoff_upper=5.0, num_rbf=50, trainable=True):
+        super(ExponentialLayer, self).__init__()
+        self.cutoff_lower = cutoff_lower
+        self.cutoff_upper = cutoff_upper
+        self.num_rbf = num_rbf
+        self.trainable = trainable
+
+        self.alpha = 5.0 / (cutoff_upper - cutoff_lower)
+
+        means, betas = self._initial_params()
+        if trainable:
+            self.register_parameter("means", nn.Parameter(means))
+            self.register_parameter("betas", nn.Parameter(betas))
+        else:
+            self.register_buffer("means", means)
+            self.register_buffer("betas", betas)
+
+    def _initial_params(self):
+        # initialize means and betas according to the default values in PhysNet
+        # https://pubs.acs.org/doi/10.1021/acs.jctc.9b00181
+        start_value = torch.exp(
+            torch.scalar_tensor(-self.cutoff_upper + self.cutoff_lower)
+        )
+        means = torch.linspace(start_value, 1, self.num_rbf)
+        betas = torch.tensor(
+            [(2 / self.num_rbf * (1 - start_value)) ** -2] * self.num_rbf
+        )
+        return means, betas
+
+    def reset_parameters(self):
+        means, betas = self._initial_params()
+        self.means.data.copy_(means)
+        self.betas.data.copy_(betas)
+
+    def forward(self, dist):
+        dist = dist.unsqueeze(-1)
+        return torch.exp(
+            -self.betas
+            * (torch.exp(self.alpha * (-dist + self.cutoff_lower)) - self.means) ** 2
+        )
+    
+    
 class EquivariantMultiheadAttention(nn.Module):
 #class EquivariantMultiheadAttention(torch_geometric.nn.MessagePassing):
     """Multi-headed attention.
@@ -29,6 +116,12 @@ class EquivariantMultiheadAttention(nn.Module):
         num_rbf=128,
         distance_influence='both',
         distance_activation_fn=nn.SiLU(),
+        cutoff_lower=0.0,
+        cutoff_upper=5.0,
+        distance_projection = 'exp',
+        trainable = True,
+        use_2d = False,
+        out_layer= False,
     ):
         super(EquivariantMultiheadAttention, self).__init__()
         self.embed_dim = embed_dim
@@ -77,6 +170,16 @@ class EquivariantMultiheadAttention(nn.Module):
         self.velocity_proj = nn.Linear(embed_dim, embed_dim * 3, bias=bias)
         
         
+        self.cutoff_lower = cutoff_lower
+        self.cutoff_upper = cutoff_upper
+        if distance_projection == 'exp':
+            self.dist_proj = ExponentialLayer(cutoff_lower, cutoff_upper, num_rbf, trainable)
+        elif distance_projection == 'gaussian':
+            self.dist_proj = GaussianLayer(num_rbf, num_edges)
+            
+        self.velocity_out = nn.Linear(embed_dim, 1, bias=False) if out_layer else None
+            
+        
         self.distance_activation_fn = distance_activation_fn
         self.distance_k_proj = None
         if distance_influence in ["keys", "both"]:
@@ -86,6 +189,7 @@ class EquivariantMultiheadAttention(nn.Module):
         if distance_influence in ["values", "both"]:
             self.distance_v_proj = nn.Linear(num_rbf, embed_dim * 3)
             
+        self.use_2d = use_2d
         self.node_dim = 0
         self.reset_parameters()
 
@@ -124,6 +228,8 @@ class EquivariantMultiheadAttention(nn.Module):
         if self.out_proj.bias is not None:
             nn.init.constant_(self.out_proj.bias, 0.0)
             
+        if self.velocity_out is not None:
+            nn.init.xavier_uniform_(self.velocity_out.weight)
                 
 
     def forward(
@@ -131,12 +237,14 @@ class EquivariantMultiheadAttention(nn.Module):
         query,
         key: Optional[Tensor],
         value: Optional[Tensor],
+        pos: Optional[Tensor],
         velocity: Optional[Tensor],
         attn_bias: Optional[Tensor],
-        edge_index: Optional[Tensor] = None,
-        edge_feature: Optional[Tensor] = None,
-        edge_direction: Optional[Tensor] = None,
-        cutoff: Optional[Tensor] = None,
+#         edge_index: Optional[Tensor] = None,
+#         edge_feature: Optional[Tensor] = None,
+#         edge_direction: Optional[Tensor] = None,
+#         cutoff: Optional[Tensor] = None,
+        adj: Optional[Tensor] = None,
         node_mask: Optional[Tensor] = None,
         key_padding_mask: Optional[Tensor] = None,
         need_weights: bool = True,
@@ -177,6 +285,19 @@ class EquivariantMultiheadAttention(nn.Module):
             )
             
             
+            
+        delta_pos = pos.unsqueeze(2) - pos.unsqueeze(1)
+        radial = torch.sum(delta_pos**2, -1)#.unsqueeze(-1)
+        dist = torch.sqrt(radial)
+        edge_feature = self.dist_proj(dist)
+        norm = dist.detach() + 1e-10
+        delta_pos = delta_pos/norm.unsqueeze(-1)
+        
+        cutoff = 0.5 * (torch.cos(dist * math.pi / self.cutoff_upper) + 1.0)
+        cutoff = cutoff * (dist < self.cutoff_upper).float() * (dist > self.cutoff_lower).float()
+        if self.use_2d and (adj is not None):
+            cutoff = torch.where((adj>0), cutoff, torch.tensor(1.).to(pos.device))
+                
         distance_k_proj = (
             self.distance_activation_fn(self.distance_k_proj(edge_feature)).view(bsz, tgt_len, tgt_len, self.num_heads, self.head_dim)
             if self.distance_k_proj is not None
@@ -190,6 +311,7 @@ class EquivariantMultiheadAttention(nn.Module):
             else None
         )
 
+        
         q = (
             q.contiguous()
             .view(bsz, tgt_len, 1, self.num_heads, self.head_dim)
@@ -274,7 +396,10 @@ class EquivariantMultiheadAttention(nn.Module):
                 attn_weights
             )
     
+        #cutoff = torch.ones(2, 4, 4)
         cutoff = cutoff.unsqueeze(-1).unsqueeze(-1)
+        nonzero_cuttoff = (cutoff != 0)
+        
         
         attn_weights_float = torch.nan_to_num(attn_weights_float)
         attn_weights = attn_weights_float.type_as(attn_weights)
@@ -283,7 +408,7 @@ class EquivariantMultiheadAttention(nn.Module):
         attn_probs = self.dropout_module(attn_weights)
         
         assert v is not None
-        attn = attn_probs * v * (cutoff != 0)
+        attn = attn_probs * v * nonzero_cuttoff
         attn = attn.sum(2)
         assert list(attn.size()) == [bsz, tgt_len, self.num_heads, self.head_dim]
 
@@ -293,12 +418,16 @@ class EquivariantMultiheadAttention(nn.Module):
             
 
         vec1 = velocity.unsqueeze(1) * value_proj1.unsqueeze(3)
-        vec2 = value_proj2.unsqueeze(3) * (edge_direction.unsqueeze(-1).unsqueeze(-1))
-        vec = ((vec1 + vec2).view(bsz, tgt_len, tgt_len, 3, embed_dim) * (cutoff != 0)).sum(2)
+        vec2 = value_proj2.unsqueeze(3) * (delta_pos.unsqueeze(-1).unsqueeze(-1))
+        vec = ((vec1 + vec2).view(bsz, tgt_len, tgt_len, 3, embed_dim) * nonzero_cuttoff).sum(2)
 
         
         dx = velocity_dot * o2 + o3
         dvec = velocity_proj3 * o1.unsqueeze(2) + vec
+        velocity = velocity.view(bsz, tgt_len, 3, embed_dim) + dvec
+        
+        if self.velocity_out is not None:
+            velocity = self.velocity_out(velocity)
         
         if node_mask is not None:
             dx = dx * node_mask
@@ -314,9 +443,10 @@ class EquivariantMultiheadAttention(nn.Module):
                 attn_weights = attn_weights.mean(dim=0)
                 
             return dx, dvec, attn_weights
-                
-        return dx, dvec, attn_weights
+            
+        return dx, velocity, attn_weights
 
+    
     def apply_sparse_mask(self, attn_weights, tgt_len: int, src_len: int, bsz: int):
         return attn_weights
         

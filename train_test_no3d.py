@@ -18,7 +18,6 @@ def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dt
     nll_epoch = []
     n_iterations = len(loader)
     for i, data in enumerate(loader):
-        x = data['positions'].to(device, dtype)
         node_mask = data['atom_mask'].to(device, dtype).unsqueeze(2)
         edge_mask = data['edge_mask'].to(device, dtype)
         one_hot = data['one_hot'].to(device, dtype)
@@ -28,20 +27,12 @@ def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dt
         attn_bias = data['attn_bias'].to(device, dtype)
         
         
-        x = remove_mean_with_mask(x, node_mask)
 
-        if args.augment_noise > 0:
-            # Add noise eps ~ N(0, augment_noise) around points.
-            eps = sample_center_gravity_zero_gaussian_with_mask(x.size(), x.device, node_mask)
-            x = x + eps * args.augment_noise
-
-        x = remove_mean_with_mask(x, node_mask)
-
-        check_mask_correct([x, one_hot, charges], node_mask)
-        assert_mean_zero_with_mask(x, node_mask)
+        check_mask_correct([one_hot, charges], node_mask)
 
         h = {'categorical': one_hot, 'integer': charges}
 
+        
         if len(args.conditioning) > 0:
             context = qm9utils.prepare_context(args.conditioning, data, property_norms).to(device, dtype)
             assert_correctly_masked(context, node_mask)
@@ -51,8 +42,8 @@ def train_epoch(args, loader, epoch, model, model_dp, model_ema, ema, device, dt
         optim.zero_grad()
 
         # transform batch through flow
-        nll, reg_term, mean_abs_z, loss_dict = losses.compute_loss_and_nll(args, model_dp, nodes_dist,
-                                                                x, h, edge_attr, attn_bias, node_mask, edge_mask, context)
+        nll, reg_term, mean_abs_z, loss_dict = losses.compute_loss_and_nll_no3d(args, model_dp, nodes_dist,
+                                                                h, edge_attr, attn_bias, node_mask, edge_mask, context)
         # standard nll from forward KL
         loss = nll + args.ode_regularization * reg_term
         loss.backward()

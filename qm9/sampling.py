@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
     assert_correctly_masked
-from qm9.analyze import check_stability, check_stability_from_molecule
+from qm9.analyze import check_stability
 
 
 def rotate_chain(z):
@@ -56,7 +56,7 @@ def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None):
     if args.dataset == 'qm9' and args.remove_h:
         n_nodes = 9
     elif args.dataset == 'qm9' or args.dataset == 'qm9_second_half' or args.dataset == 'qm9_first_half':
-        n_nodes = 19
+        n_nodes = 29
     elif args.dataset == 'geom':
         n_nodes = 44
     else:
@@ -76,36 +76,36 @@ def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None):
     edge_mask = edge_mask.repeat(n_samples, 1, 1).view(-1, 1).to(device)
 
     if args.probabilistic_model == 'diffusion':
-        one_hot, charges, x, adj = None, None, None, None
+        one_hot, charges, x, edge = None, None, None, None
         for i in range(n_tries):
-            chain, chain_adj = flow.sample_chain(n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=30)
+            chain, chain_edge = flow.sample_chain(n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=20)
+            
             chain = reverse_tensor(chain)
-            chain_adj = reverse_tensor(chain_adj)
+            chain_edge = reverse_tensor(chain_edge)
 
             # Repeat last frame to see final sample better.
             chain = torch.cat([chain, chain[-1:].repeat(10, 1, 1)], dim=0)
-            chain_adj = torch.cat([chain_adj, chain_adj[-1:].repeat(10, 1, 1, 1)], dim=0)
+            chain_edge = torch.cat([chain_edge, chain_edge[-1:].repeat(10, 1, 1, 1)], dim=0)
+            
             
             x = chain[-1:, :, 0:3]
+            
             one_hot = chain[-1:, :, 3:-1]
             one_hot = torch.argmax(one_hot, dim=2)
-            adj = chain_adj[-1:, :, :, :].long()
-            adj = torch.argmax(adj, dim=-1)
             
+            edge = chain_edge[-1:, :, :, :].long()
+            edge = torch.argmax(edge, dim=-1)
 
             atom_type = one_hot.squeeze(0).cpu().detach().numpy()
-            edge_type = adj.squeeze(0).cpu().detach().numpy()
+            edge_type = edge.squeeze(0).cpu().detach().numpy()
             x_squeeze = x.squeeze(0).cpu().detach().numpy()
-            #mol_stable = check_stability(x_squeeze, atom_type, dataset_info)[0]
-            mol_stable = check_stability_from_molecule(atom_type, edge_type, dataset_info)[0]
+            mol_stable = check_stability(x_squeeze, atom_type, dataset_info)[0]
 
             # Prepare entire chain.
             x = chain[:, :, 0:3]
             one_hot = chain[:, :, 3:-1]
             one_hot = F.one_hot(torch.argmax(one_hot, dim=2), num_classes=len(dataset_info['atom_decoder']))
             charges = torch.round(chain[:, :, -1:]).long()
-            
-
 
             if mol_stable:
                 print('Found stable molecule to visualize :)')
@@ -116,7 +116,7 @@ def sample_chain(args, device, flow, n_tries, dataset_info, prop_dist=None):
     else:
         raise ValueError
 
-    return one_hot, charges, x, adj
+    return one_hot, charges, x, edge
 
 
 def sample(args, device, generative_model, dataset_info,
@@ -148,14 +148,14 @@ def sample(args, device, generative_model, dataset_info,
         context = None
 
     if args.probabilistic_model == 'diffusion':
-        x, h, adj = generative_model.sample(batch_size, max_n_nodes, node_mask, edge_mask, context, fix_noise=fix_noise)
+        x, h, edge = generative_model.sample(batch_size, max_n_nodes, node_mask, edge_mask, context, fix_noise=fix_noise)
 
         assert_correctly_masked(x, node_mask)
         assert_mean_zero_with_mask(x, node_mask)
 
         one_hot = h['categorical']
         charges = h['integer']
-        adj = adj.long()
+        edge = edge.long()
 
         assert_correctly_masked(one_hot.float(), node_mask)
         if args.include_charges:
@@ -164,7 +164,7 @@ def sample(args, device, generative_model, dataset_info,
     else:
         raise ValueError(args.probabilistic_model)
 
-    return one_hot, charges, x, adj, node_mask
+    return one_hot, charges, x, edge, node_mask
 
 
 def sample_sweep_conditional(args, device, generative_model, dataset_info, prop_dist, n_nodes=19, n_frames=100):

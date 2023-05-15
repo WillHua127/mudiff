@@ -257,23 +257,48 @@ class TransformerEncoder(nn.Module):
                         use_x_layernorm=equivariant_use_x_layernorm,
                         use_dx_laynorm=equivariant_use_dx_layernorm,
                         use_dx_droppath_prob=equivariant_dx_dropout,
-                        )
-                for _ in range(num_encoder_layers)
+                        cutoff_lower=cutoff_lower,
+                        cutoff_upper=cutoff_upper,
+                        distance_projection = distance_projection,
+                        trainable_dist_proj = trainable_dist_proj,
+                        use_2d = equivariant_apply_concrete_adjacency,
+                        out_layer = True,
+                        ) if i==(num_encoder_layers-1) else self.build_transformer_3d_encoder_layer(
+                                                                embedding_dim=embedding_dim,
+                                                                num_attention_heads=num_attention_heads,
+                                                                attention_dropout=equivariant_in_attention_dropout,
+                                                                q_noise=in_attention_quant_noise,
+                                                                qn_block_size=in_attention_qn_block_size,
+                                                                attention_activation_fn=equivariant_attention_activation_fn,
+                                                                num_rbf=num_3d_bias_kernel,
+                                                                distance_influence=equivariant_distance_influence,
+                                                                distance_activation_fn=equivariant_distance_activation_fn,
+                                                                use_x_layernorm=equivariant_use_x_layernorm,
+                                                                use_dx_laynorm=equivariant_use_dx_layernorm,
+                                                                use_dx_droppath_prob=equivariant_dx_dropout,
+                                                                cutoff_lower=cutoff_lower,
+                                                                cutoff_upper=cutoff_upper,
+                                                                distance_projection = distance_projection,
+                                                                trainable_dist_proj = trainable_dist_proj,
+                                                                use_2d = equivariant_apply_concrete_adjacency,
+                                                                out_layer = False,
+                                                                )
+                for i in range(num_encoder_layers)
             ]
         ) if self.transformer_3d_layers is not None else None
         
         self.num_layers = num_encoder_layers
         
-        self.geom_info = GeometricInformation(
-                                n_layers=num_encoder_layers,
-                                num_edges=num_edges,
-                                num_kernel=num_3d_bias_kernel,
-                                cutoff_lower=cutoff_lower,
-                                cutoff_upper=cutoff_upper,
-                                distance_projection = distance_projection,
-                                trainable = trainable_dist_proj,
-                                use_2d = equivariant_apply_concrete_adjacency,
-                            ) if (self.transformer_3d_layers is not None) else None
+#         self.geom_info = GeometricInformation(
+#                                 n_layers=num_encoder_layers,
+#                                 num_edges=num_edges,
+#                                 num_kernel=num_3d_bias_kernel,
+#                                 cutoff_lower=cutoff_lower,
+#                                 cutoff_upper=cutoff_upper,
+#                                 distance_projection = distance_projection,
+#                                 trainable = trainable_dist_proj,
+#                                 use_2d = equivariant_apply_concrete_adjacency,
+#                             ) if (self.transformer_3d_layers is not None) else None
         
         
         
@@ -283,14 +308,7 @@ class TransformerEncoder(nn.Module):
                                             v_out=1, 
                                             activation=equivariant_output_activation_fn
                                     ) if use_equivariant_output_projection else None
-            
-            
-        self.coordinate_proj = nn.Sequential(
-                                    nn.Linear(embedding_dim, embedding_dim),
-                                    equivariant_coord_activation_fn,
-                                    nn.Linear(embedding_dim, 1),
-                                ) if (self.transformer_3d_layers is not None) else None
-        
+                    
         
         self.out_node_proj = nn.Sequential(
                                     nn.Linear(embedding_dim, embedding_dim),
@@ -387,6 +405,12 @@ class TransformerEncoder(nn.Module):
             use_x_layernorm,
             use_dx_laynorm,
             use_dx_droppath_prob,
+            cutoff_lower,
+            cutoff_upper,
+            distance_projection,
+            trainable_dist_proj,
+            use_2d,
+            out_layer,
             ):
             
             return EquivariantTransformerEncoderLayer(
@@ -402,6 +426,12 @@ class TransformerEncoder(nn.Module):
                         use_x_layernorm=use_x_layernorm,
                         use_dx_laynorm=use_dx_laynorm,
                         use_dx_droppath_prob=use_dx_droppath_prob,
+                        cutoff_lower=cutoff_lower,
+                        cutoff_upper=cutoff_upper,
+                        distance_projection = distance_projection,
+                        trainable_dist_proj = trainable_dist_proj,
+                        use_2d = use_2d,
+                        out_layer=out_layer,
                         )
 
         
@@ -416,7 +446,6 @@ class TransformerEncoder(nn.Module):
         #padding_mask_cls = torch.zeros(bs, 1, device=padding_mask.device, dtype=padding_mask.dtype)
         #padding_mask = torch.cat((padding_mask_cls, padding_mask), dim=1)
         
-        
         attn_mask = None
         
         ### A.0 Encoding
@@ -430,10 +459,11 @@ class TransformerEncoder(nn.Module):
 
         ### A.3 Obtaining (3d) attention biases & Encoding (with 3d information)
         delta_pos = None
-        if (self.molecule_3d_bias is not None) and not (pos == 0).all():
-            attn_bias_3d, merged_edge_features, delta_pos = self.molecule_3d_bias(node_features, pos)
+        if pos is not None:
+            if (self.molecule_3d_bias is not None) and not (pos == 0).all():
+                attn_bias_3d, merged_edge_features, delta_pos = self.molecule_3d_bias(node_features, pos)
 
-            attn_bias[:, :, 1:, 1:] = attn_bias[:, :, 1:, 1:] + attn_bias_3d
+                attn_bias[:, :, 1:, 1:] = attn_bias[:, :, 1:, 1:] + attn_bias_3d
             #x[:, 1:, :] = x[:, 1:, :] + merged_edge_features * 0.01
 
             
@@ -445,8 +475,9 @@ class TransformerEncoder(nn.Module):
             
         ### A.5 Encoding (with 3d neighborhood information)
         x_neighbors_3d = None
-        if (self.molecule_3d_neighbor_embedding is not None) and not (pos == 0).all():
-            x_neighbors_3d = self.molecule_3d_neighbor_embedding(node_features, pos, adj)
+        if pos is not None:
+            if (self.molecule_3d_neighbor_embedding is not None) and not (pos == 0).all():
+                x_neighbors_3d = self.molecule_3d_neighbor_embedding(node_features, pos, adj)
             
             
         ### A.6 Combining x with 2d, 3d neighborhood information
@@ -489,11 +520,14 @@ class TransformerEncoder(nn.Module):
             #attn_bias = attn_bias.contiguous().permute(0, 2, 3, 1)
 
             
-        edge_index_3d, edge_feature_3d, edge_direction_3d, cutoff_3d, velocity = None, None, None, None, None
-        if (self.transformer_3d_layers is not None) and (not (pos == 0).all()):
-            edge_index_3d, edge_feature_3d, edge_direction_3d, cutoff_3d = self.geom_info(pos, adj)
+        #edge_index_3d, edge_feature_3d, edge_direction_3d, cutoff_3d, velocity = None, None, None, None, None
+        #if (self.transformer_3d_layers is not None) and (not (pos == 0).all()):
+        #    edge_index_3d, edge_feature_3d, edge_direction_3d, cutoff_3d = self.geom_info(pos, adj)
             
-            velocity = torch.zeros(bs, n_nodes, 3, self.embedding_dim, device=x.device)
+        velocity = None
+        if pos is not None:
+            if not (pos == 0).all():
+                velocity = torch.zeros(bs, n_nodes, 3, self.embedding_dim, device=x.device)
             
             
         
@@ -508,11 +542,11 @@ class TransformerEncoder(nn.Module):
 
                     assert velocity.shape[-1] == x.shape[-1]
 
-                    dx, dvec, _ = self.transformer_3d_layers[i](x, velocity, edge_index=edge_index_3d, edge_feature=edge_feature_3d, edge_direction=edge_direction_3d, cutoff=cutoff_3d, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
+                    dx, velocity, _ = self.transformer_3d_layers[i](x, pos, velocity, adj=adj, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
 
                     #x[:, 1:, :] = x[:, 1:, :] + dx
                     x = x + dx
-                    velocity = velocity + dvec
+                    #velocity = velocity + dvec
                     
                    
                 
@@ -528,10 +562,10 @@ class TransformerEncoder(nn.Module):
 
                     assert velocity.shape[-1] == x.shape[-1]
 
-                    dx, dvec, _ = self.transformer_3d_layers[i](x_3d, velocity, edge_index=edge_index_3d, edge_feature=edge_feature_3d, edge_direction=edge_direction_3d, cutoff=cutoff_3d, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
+                    dx, velocity, _ = self.transformer_3d_layers[i](x, pos, velocity, adj=adj, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
+
 
                     x_3d = x_3d + dx
-                    velocity = velocity + dvec
                     
                     x = x + x_3d
                     
@@ -550,13 +584,16 @@ class TransformerEncoder(nn.Module):
 
                     assert velocity.shape[-1] == x.shape[-1]
 
-                    dx, dvec, _ = self.transformer_3d_layers[i](x_3d, velocity, edge_index=edge_index_3d, edge_feature=edge_feature_3d, edge_direction=edge_direction_3d, cutoff=cutoff_3d, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
+                    dx, velocity, _ = self.transformer_3d_layers[i](x, pos, velocity, adj=adj, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
+
 
                     x_3d = x_3d + dx
-                    velocity = velocity + dvec
+                    #velocity = velocity + dvec
                     x = self.combine_proj(torch.cat([x, x_3d], dim=-1))
                     
                     x_3d = x
+                    
+                    #return None, None, pos + velocity.squeeze()
                     
                     
         ####################################################################################            
@@ -571,10 +608,10 @@ class TransformerEncoder(nn.Module):
 
                     assert velocity.shape[-1] == x.shape[-1]
 
-                    dx, dvec, _ = self.transformer_3d_layers[i](x_3d, velocity, edge_index=edge_index_3d, edge_feature=edge_feature_3d, edge_direction=edge_direction_3d, cutoff=cutoff_3d, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
+                    dx, velocity, _ = self.transformer_3d_layers[i](x, pos, velocity, adj=adj, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
+
 
                     x_3d = x_3d + dx
-                    velocity = velocity + dvec
                     
                 
             if (self.transformer_3d_layers is not None) and (velocity is not None):
@@ -584,18 +621,19 @@ class TransformerEncoder(nn.Module):
                     
         x_out = x
         pos_out = None
-        if (self.equivariant_output is not None) and (not (pos == 0).all()) and (velocity is not None):
-            x_out, v_out = self.equivariant_output(x, velocity)
-            pos_out = v_out.squeeze() + pos
+        
+        if pos is not None:
+            if (velocity is not None) and not (pos == 0).all():
+                pos_out = pos + velocity.squeeze()
+
+            
+        if (self.equivariant_output is not None) and (velocity is not None):
+            x_out, _ = self.equivariant_output(x, velocity)
             
         else:
-            
-            if (self.coordinate_proj is not None) and (not (pos == 0).all()) and (velocity is not None):
-                pos_out = self.coordinate_proj(velocity).squeeze() + pos
-            
-            if self.out_node_proj is not None:
-                x_out = self.out_node_proj(x)
-            
+            x_out = self.out_node_proj(x)
+        
+
         x_out = x_out * node_mask
         
         if pos_out is not None:
@@ -613,5 +651,4 @@ class TransformerEncoder(nn.Module):
             adj_out = 1/2 * (adj_out + torch.transpose(adj_out, 1, 2))
             
             
-        
         return x_out, adj_out, pos_out

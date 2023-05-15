@@ -11,7 +11,7 @@ from qm9.data.prepare import prepare_dataset
 
 def initialize_datasets(args, datadir, dataset, subset=None, splits=None,
                         force_download=False, subtract_thermo=False,
-                        remove_h=False):
+                        remove_h=False, use3d=True):
     """
     Initialize datasets.
 
@@ -66,31 +66,45 @@ def initialize_datasets(args, datadir, dataset, subset=None, splits=None,
             datasets[split] = {key: torch.from_numpy(
                 val) for key, val in f.items()}
 
-    if dataset != 'qm9':
-        np.random.seed(42)
-        fixed_perm = np.random.permutation(len(datasets['train']['num_atoms']))
-        if dataset == 'qm9_second_half':
-            sliced_perm = fixed_perm[len(datasets['train']['num_atoms'])//2:]
-        elif dataset == 'qm9_first_half':
-            sliced_perm = fixed_perm[0:len(datasets['train']['num_atoms']) // 2]
-        else:
-            raise Exception('Wrong dataset name')
+#     if dataset != 'qm9':
+#         np.random.seed(42)
+#         fixed_perm = np.random.permutation(len(datasets['train']['num_atoms']))
+#         if dataset == 'qm9_second_half':
+#             sliced_perm = fixed_perm[len(datasets['train']['num_atoms'])//2:]
+#         elif dataset == 'qm9_first_half':
+#             sliced_perm = fixed_perm[0:len(datasets['train']['num_atoms']) // 2]
+#         else:
+#             raise Exception('Wrong dataset name')
+#         for key in datasets['train']:
+#             datasets['train'][key] = datasets['train'][key][sliced_perm]
+
+
+    if not use3d:
+        fixed_perm = [i for i in range(len(datasets['train']['num_atoms']))]
+        sliced_perm = fixed_perm[0:len(datasets['train']['num_atoms']) // 10]
         for key in datasets['train']:
-            datasets['train'][key] = datasets['train'][key][sliced_perm]
+                datasets['train'][key] = datasets['train'][key][sliced_perm]
 
+        fixed_perm = [i for i in range(len(datasets['test']['num_atoms']))]
+        for key in datasets['test']:
+                datasets['test'][key] = datasets['test'][key][sliced_perm]
 
+        fixed_perm = [i for i in range(len(datasets['valid']['num_atoms']))]
+        for key in datasets['valid']:
+                datasets['valid'][key] = datasets['valid'][key][sliced_perm]
+                
     # fixed_perm = np.random.permutation(len(datasets['train']['num_atoms']))
-    # sliced_perm = fixed_perm[0:len(datasets['train']['num_atoms']) // 100]
+    # sliced_perm = fixed_perm[0:len(datasets['train']['num_atoms']) // 1000]
     # for key in datasets['train']:
     #         datasets['train'][key] = datasets['train'][key][sliced_perm]
 
     # fixed_perm = np.random.permutation(len(datasets['test']['num_atoms']))
-    # sliced_perm = fixed_perm[0:len(datasets['test']['num_atoms']) // 10]
+    # sliced_perm = fixed_perm[0:len(datasets['test']['num_atoms']) // 100]
     # for key in datasets['test']:
     #         datasets['test'][key] = datasets['test'][key][sliced_perm]
 
     # fixed_perm = np.random.permutation(len(datasets['valid']['num_atoms']))
-    # sliced_perm = fixed_perm[0:len(datasets['valid']['num_atoms']) // 10]
+    # sliced_perm = fixed_perm[0:len(datasets['valid']['num_atoms']) // 100]
     # for key in datasets['valid']:
     #         datasets['valid'][key] = datasets['valid'][key][sliced_perm]
 

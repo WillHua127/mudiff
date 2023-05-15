@@ -230,7 +230,6 @@ def check_stability(positions, atom_type, dataset_info, debug=False):
                     (atom_decoder[pair[0]], atom_decoder[pair[1]]), dist)
             nr_bonds[i] += order
             nr_bonds[j] += order
-            
     nr_stable_bonds = 0
     for atom_type_i, nr_bonds_i in zip(atom_type, nr_bonds):
         possible_bonds = bond_analyze.allowed_bonds[atom_decoder[atom_type_i]]
@@ -246,29 +245,30 @@ def check_stability(positions, atom_type, dataset_info, debug=False):
     return molecule_stable, nr_stable_bonds, len(x)
 
 
-def check_stability_from_molecule(atom_type, edge_type, dataset_info, debug=False):
+
+def check_stability_from_molecule(atom_types, edge_types, dataset_info, debug=False):
     atom_decoder = dataset_info['atom_decoder']
+    n_bonds = np.zeros(len(atom_types), dtype='int')
 
-    nr_bonds = np.zeros(len(atom_type), dtype='int')
-
-    for i in range(len(atom_type)):
-        for j in range(i + 1, len(atom_type)):
-            nr_bonds[i] += abs((edge_type[i][j] + edge_type[j][i])/2)
-            nr_bonds[j] += abs((edge_type[i][j] + edge_type[j][i])/2)
+    for i in range(len(atom_types)):
+        for j in range(i + 1, len(atom_types)):
+            n_bonds[i] += abs((edge_types[i, j] + edge_types[j, i])/2)
+            n_bonds[j] += abs((edge_types[i, j] + edge_types[j, i])/2)
             
-    nr_stable_bonds = 0
-    for atom_type_i, nr_bonds_i in zip(atom_type, nr_bonds):
-        possible_bonds = bond_analyze.allowed_bonds[atom_decoder[atom_type_i]]
+    n_stable_bonds = 0
+    for atom_type, atom_n_bond in zip(atom_types, n_bonds):
+        possible_bonds = bond_analyze.allowed_bonds[atom_decoder[atom_type]]
         if type(possible_bonds) == int:
-            is_stable = possible_bonds == nr_bonds_i
+            is_stable = possible_bonds == atom_n_bond
         else:
-            is_stable = nr_bonds_i in possible_bonds
+            is_stable = atom_n_bond in possible_bonds
         if not is_stable and debug:
-            print("Invalid bonds for molecule %s with %d bonds" % (atom_decoder[atom_type_i], nr_bonds_i))
-        nr_stable_bonds += int(is_stable)
+            print("Invalid bonds for molecule %s with %d bonds" % (atom_decoder[atom_type], atom_n_bond))
+        n_stable_bonds += int(is_stable)
 
-    molecule_stable = nr_stable_bonds == len(atom_type)
-    return molecule_stable, nr_stable_bonds, len(atom_type)
+    molecule_stable = n_stable_bonds == len(atom_types)
+    return molecule_stable, n_stable_bonds, len(atom_types)
+
 
 
 def process_loader(dataloader):
@@ -345,12 +345,13 @@ def main_check_stability(remove_h: bool, batch_size=32):
         print('For test')
         test_validity_for(test_loader)
 
+        
 
 def analyze_stability_for_molecules(molecule_list, dataset_info):
     one_hot = molecule_list['one_hot']
     x = molecule_list['x']
+    edge = molecule_list['edge']
     node_mask = molecule_list['node_mask']
-    adj = molecule_list['adj']
 
     if isinstance(node_mask, torch.Tensor):
         atomsxmol = torch.sum(node_mask, dim=1)
@@ -367,18 +368,21 @@ def analyze_stability_for_molecules(molecule_list, dataset_info):
 
     for i in range(n_samples):
         atom_type = one_hot[i].argmax(1).cpu().detach()
+        edge_type = edge[i].argmax(-1).cpu().detach()
         pos = x[i].cpu().detach()
-        edge_type = adj[i].argmax(-1).cpu().detach()
 
         atom_type = atom_type[0:int(atomsxmol[i])]
-        pos = pos[0:int(atomsxmol[i])]
         edge_type = edge_type[0:int(atomsxmol[i]), 0:int(atomsxmol[i])]
-        processed_list.append((pos, atom_type, edge_type))
+        pos = pos[0:int(atomsxmol[i])]
+        processed_list.append((atom_type, edge_type, pos))
+        #pos = pos[0:int(atomsxmol[i])]
+        #processed_list.append((pos, atom_type))
 
     for mol in processed_list:
-        pos, atom_type, edge_type = mol
-        #validity_results = check_stability(pos, atom_type, dataset_info)
-        validity_results = check_stability_from_molecule(atom_type, edge_type, dataset_info)
+        atom_type, edge_type, pos = mol
+        validity_results = check_stability(pos, atom_type, dataset_info)
+#         atom_type, edge_type = mol
+#         validity_results = check_stability_from_molecule(atom_type, edge_type, dataset_info)
 
         molecule_stable += int(validity_results[0])
         nr_stable_bonds += int(validity_results[1])
@@ -421,3 +425,4 @@ if __name__ == '__main__':
 
     # main_analyze_qm9(remove_h=False, dataset_name='qm9')
     main_check_stability(remove_h=False)
+

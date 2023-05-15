@@ -6,7 +6,7 @@ except ModuleNotFoundError:
 import utils
 import argparse
 from qm9 import dataset
-from qm9.models import get_model, get_prop_dist
+from qm9.models import get_optim, get_model, get_prop_dist
 import os
 from equivariant_diffusion.utils import assert_mean_zero_with_mask, remove_mean_with_mask,\
     assert_correctly_masked
@@ -37,17 +37,18 @@ def analyze_and_save(args, eval_args, device, generative_model,
                      batch_size=10, save_to_xyz=False):
     batch_size = min(batch_size, n_samples)
     assert n_samples % batch_size == 0
-    molecules = {'one_hot': [], 'x': [], 'node_mask': [], 'adj': []}
+    molecules = {'one_hot': [], 'x': [], 'edge': [], 'node_mask': []}
     start_time = time.time()
+
     for i in range(int(n_samples/batch_size)):
         nodesxsample = nodes_dist.sample(batch_size)
-        one_hot, charges, x, adj, node_mask = sample(
-                args, device, generative_model, dataset_info, prop_dist=prop_dist, nodesxsample=nodesxsample)
+        one_hot, charges, x, edge, node_mask = sample(args, device, generative_model, dataset_info, prop_dist,
+                                                    nodesxsample=nodesxsample)
 
         molecules['one_hot'].append(one_hot.detach().cpu())
         molecules['x'].append(x.detach().cpu())
+        molecules['edge'].append(edge.detach().cpu())
         molecules['node_mask'].append(node_mask.detach().cpu())
-        molecules['adj'].append(adj.detach().cpu())
 
         current_num_samples = (i+1) * batch_size
         secs_per_sample = (time.time() - start_time) / current_num_samples
@@ -75,13 +76,14 @@ def test(args, flow_dp, nodes_dist, device, dtype, loader, partition='Test', num
     for pass_number in range(num_passes):
         with torch.no_grad():
             for i, data in enumerate(loader):
-                # Get data
                 x = data['positions'].to(device, dtype)
+                batch_size = x.size(0)
                 node_mask = data['atom_mask'].to(device, dtype).unsqueeze(2)
                 edge_mask = data['edge_mask'].to(device, dtype)
                 one_hot = data['one_hot'].to(device, dtype)
                 charges = (data['charges'] if args.include_charges else torch.zeros(0)).to(device, dtype)
-                
+
+
                 edge_attr = data['edge_attr'].to(device, dtype)
                 attn_bias = data['attn_bias'].to(device, dtype)
 
@@ -100,7 +102,7 @@ def test(args, flow_dp, nodes_dist, device, dtype, loader, partition='Test', num
                     context = None
 
                 # transform batch through flow
-                nll, _, _, _ = losses.compute_loss_and_nll(args, flow_dp, nodes_dist, 
+                nll, _, _, _ = losses.compute_loss_and_nll(args, flow_dp, nodes_dist,
                                                         x, h, edge_attr, attn_bias, node_mask, edge_mask, context)
                 # standard nll from forward KL
 
@@ -113,11 +115,11 @@ def test(args, flow_dp, nodes_dist, device, dtype, loader, partition='Test', num
     return nll_epoch/n_samples
 
 
-def main():
+def main(local_rank):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, default="outputs/edm_qm9",
+    parser.add_argument('--model_path', type=str, default="outputs/edm_1",
                         help='Specify model path')
-    parser.add_argument('--n_samples', type=int, default=4,
+    parser.add_argument('--n_samples', type=int, default=100,
                         help='Specify model path')
     parser.add_argument('--batch_size_gen', type=int, default=100,
                         help='Specify model path')
@@ -141,18 +143,17 @@ def main():
     device = torch.device("cuda" if args.cuda else "cpu")
     args.device = device
     dtype = torch.float32
-    args.dp = False
     utils.create_folders(args)
+    print(args)
 
     # Retrieve QM9 dataloaders
-    dataloaders, charge_scale, _ = dataset.retrieve_dataloaders(args)
+    dataloaders, charge_scale = dataset.retrieve_dataloaders_single_gpu(args)
 
     dataset_info = get_dataset_info(args.dataset, args.remove_h)
+    prop_dist = get_prop_dist(args, dataloaders['train'])
 
     # Load model
     generative_model, nodes_dist = get_model(args, dataset_info)
-    prop_dist = get_prop_dist(args, dataloaders['train'])
-    
     if prop_dist is not None:
         property_norms = compute_mean_mad(dataloaders, args.conditioning, args.dataset)
         prop_dist.set_normalizer(property_norms)
@@ -162,7 +163,6 @@ def main():
     flow_state_dict = torch.load(join(eval_args.model_path, fn), map_location=device)
     generative_model.load_state_dict(flow_state_dict)
 
-    print('Starting analyzing...')
     # Analyze stability, validity, uniqueness and novelty
     stability_dict, rdkit_metrics = analyze_and_save(
         args, eval_args, device, generative_model, nodes_dist,
@@ -202,4 +202,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(0)

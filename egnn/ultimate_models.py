@@ -3,6 +3,9 @@ import torch.nn as nn
 from equivariant_diffusion.utils import remove_mean, remove_mean_with_mask
 import numpy as np
 
+from egnn.transformer import GraphTransformer
+from egnn.egnn import EGNN
+from torch_geometric.utils.sparse import dense_to_sparse
 
 class Transformer_dynamics(nn.Module):
     def __init__(self, model, context_node_dim, n_dims=3, condition_time=False, device='cpu'):
@@ -14,6 +17,9 @@ class Transformer_dynamics(nn.Module):
         self.device = device
         self.n_dims = n_dims
         self.condition_time = condition_time
+        
+        self.transformer = GraphTransformer()
+        self.egnn = EGNN(6, 1, 64)
 
 
     def forward(self, t, xh, attn_bias, spatial_pos=None, edge_input=None, edge_type=None, adj=None, node_mask=None, edge_mask=None, context=None):
@@ -46,7 +52,17 @@ class Transformer_dynamics(nn.Module):
             h = torch.cat([h, context], dim=1)
 
 
-        h_final, adj_final, x_final = self.model(h, attn_bias, spatial_pos=spatial_pos, edge_input=edge_input, edge_type=edge_type, pos=x, adj=adj, node_mask=node_mask, edge_mask=edge_mask)
+        _, adj_final, _ = self.model(h, attn_bias, spatial_pos=spatial_pos, edge_input=edge_input, edge_type=edge_type, pos=x, adj=adj, node_mask=node_mask, edge_mask=edge_mask)
+        
+        h_final, x_final = self.egnn(h.view(bs*n_nodes, -1), x.view(bs*n_nodes, -1), dense_to_sparse(adj)[0], node_mask=node_mask.view(bs*n_nodes, 1), edge_mask=edge_mask.view(bs*n_nodes*n_nodes, 1))
+        h_final = h_final.view(bs, n_nodes, -1)
+        x_final = x_final.view(bs, n_nodes, -1)
+        
+        #h_final, adj_final, x_final = self.transformer(h, attn_bias, spatial_pos=spatial_pos, edge_input=edge_input, edge_type=edge_type, pos=x, adj=adj, node_mask=node_mask, edge_mask=edge_mask)
+        #h_final, adj_final = self.transformer(h, edge_type, torch.rand(bs, 0), node_mask, edge_mask)
+        #x_final = x
+        
+        
         
         vel = (x_final - x) * node_mask  # This masking operation is redundant but just in case
         adj_final = adj_final * edge_mask

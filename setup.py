@@ -1,6 +1,12 @@
-from distutils.core import setup, Extension
-from Cython.Build import cythonize
-import numpy
+from setuptools import setup, find_packages
 
-package = Extension('algos', ['algos.pyx'], include_dirs=[numpy.get_include()])
-setup(ext_modules=cythonize([package]))
+setup(
+    name='EN_diffusion',
+    version='1.0.0',
+    url=None,
+    author='Author Name',
+    author_email='author@gmail.com',
+    description='Description of my package',
+    packages=find_packages(),
+    install_requires=['numpy >= 1.11.1', 'matplotlib >= 1.5.1']
+)

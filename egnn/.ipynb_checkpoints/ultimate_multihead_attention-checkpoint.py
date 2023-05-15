@@ -196,9 +196,12 @@ class MultiheadAttention(nn.Module):
         v = self.v_proj(query)
         
         if node_mask is not None:
-            q[:, 1:, :] = q[:, 1:, :] * node_mask
-            k[:, 1:, :] = k[:, 1:, :] * node_mask
-            v[:, 1:, :] = v[:, 1:, :] * node_mask
+            # q[:, 1:, :] = q[:, 1:, :] * node_mask
+            # k[:, 1:, :] = k[:, 1:, :] * node_mask
+            # v[:, 1:, :] = v[:, 1:, :] * node_mask
+            q = q * node_mask
+            k = k * node_mask
+            v = v * node_mask
         
         q *= self.scaling
 
@@ -231,8 +234,8 @@ class MultiheadAttention(nn.Module):
             assert key_padding_mask.size(1) == src_len
 
         attn_weights = q * k
-        attn_weights = attn_weights / math.sqrt(attn_weights.size(-1))
-        attn_weights = self.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
+        #attn_weights = attn_weights / math.sqrt(attn_weights.size(-1))
+        #attn_weights = self.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
 
         assert list(attn_weights.size()) == [bsz, tgt_len, src_len, self.num_heads, self.head_dim]
         
@@ -251,9 +254,12 @@ class MultiheadAttention(nn.Module):
             E2 = E2.view(bsz, n_nodes, n_nodes, self.num_heads, self.head_dim)
             
             # Incorporate edge features to the self attention scores.
-            attn_weights[:, 1:, 1:, :, :] = (attn_weights[:, 1:, 1:, :, :].clone() * (E1 + 1)) + E2
+            # attn_weights[:, 1:, 1:, :, :] = (attn_weights[:, 1:, 1:, :, :].clone() * (E1 + 1)) + E2
             
-            new_adj = attn_weights[:, 1:, 1:, :, :].view(bsz, n_nodes, n_nodes, self.num_heads*self.head_dim) + attn_weights[:, 0, 0, :, :].view(bsz, 1, 1, self.num_heads*self.head_dim)
+            # new_adj = attn_weights[:, 1:, 1:, :, :].view(bsz, n_nodes, n_nodes, self.num_heads*self.head_dim) + attn_weights[:, 0, 0, :, :].view(bsz, 1, 1, self.num_heads*self.head_dim)
+            attn_weights = (attn_weights * (E1 + 1)) + E2
+            
+            new_adj = attn_weights.clone().view(bsz, n_nodes, n_nodes, self.num_heads*self.head_dim)
             
             if (graph_feature is not None) & self.use_graph_embedding:
                 G1 = self.g_mul_proj(graph_feature).view(bsz, 1, 1, self.num_heads*self.head_dim)
@@ -263,9 +269,9 @@ class MultiheadAttention(nn.Module):
             new_adj = self.e_out_proj(new_adj) * edge_mask
             
             
-        if (graph_feature is not None) & self.use_graph_embedding & self.use_graph_embedding_bias:
-            G_bias = self.g_bias_proj(graph_feature).view(bsz, self.num_heads, self.head_dim)
-            attn_weights[:, 0, 0, :, :] = attn_weights[:, 0, 0, :, :] + G_bias
+        # if (graph_feature is not None) & self.use_graph_embedding & self.use_graph_embedding_bias:
+        #     G_bias = self.g_bias_proj(graph_feature).view(bsz, self.num_heads, self.head_dim)
+        #     attn_weights[:, 0, 0, :, :] = attn_weights[:, 0, 0, :, :] + G_bias
             
             
         if (graph_feature is not None) & self.use_graph_embedding:
@@ -274,7 +280,7 @@ class MultiheadAttention(nn.Module):
             
             if (adj is not None) & self.use_adjacency:
                 edge2graph = self.edge_to_graph_proj(adj)
-                new_graph_feature = edge2graph + graph_feature
+                new_graph_feature = edge2graph + new_graph_feature
                 
             new_graph_feature = self.g_out_proj(new_graph_feature)
                     
@@ -331,7 +337,8 @@ class MultiheadAttention(nn.Module):
         attn = self.out_proj(attn)
         
         if node_mask is not None:
-            attn[:, 1:, :] = attn[:, 1:, :] * node_mask
+            #attn[:, 1:, :] = attn[:, 1:, :] * node_mask
+            attn = attn * node_mask
 
 
         attn_weights: Optional[Tensor] = None

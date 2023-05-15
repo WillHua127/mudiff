@@ -365,7 +365,7 @@ def main(local_rank):
 
     
     # Retrieve QM9 dataloaders
-    dataloaders, charge_scale, train_sampler = dataset.retrieve_dataloaders(args)
+    dataloaders, charge_scale, train_sampler = dataset.retrieve_dataloaders(args, use3d=False)
 
     data_dummy = next(iter(dataloaders['train']))
     prop_dist = get_prop_dist(args, dataloaders['train'])

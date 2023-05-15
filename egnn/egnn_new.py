@@ -1,10 +1,6 @@
 from torch import nn
 import torch
 import math
-from egnn.mlp import MLP
-from egnn.gnn import GIN
-from egnn.transformer import GraphTransformer
-#from equivariant_diffusion.utils import mask_adjs, node_feature_to_matrix
 
 class GCL(nn.Module):
     def __init__(self, input_nf, output_nf, hidden_nf, normalization_factor, aggregation_method,
@@ -154,107 +150,10 @@ class EquivariantBlock(nn.Module):
 class EGNN(nn.Module):
     def __init__(self, in_node_nf, in_edge_nf, hidden_nf, device='cpu', act_fn=nn.SiLU(), n_layers=3, attention=False,
                  norm_diff=True, out_node_nf=None, tanh=False, coords_range=15, norm_constant=1, inv_sublayers=2,
-                 sin_embedding=False, normalization_factor=100, aggregation_method='sum', adj_type='digress'):
-        super(EGNN, self).__init__()
-        self.device = device
-        self.normalization_factor = normalization_factor
-        self.aggregation_method = aggregation_method
-        self.in_node_nf = in_node_nf
-
-        if sin_embedding:
-            self.sin_embedding = SinusoidsEmbeddingNew()
-            edge_feat_nf = self.sin_embedding.dim * 2
-        else:
-            self.sin_embedding = None
-            edge_feat_nf = 2
-        
-        
-        
-        self.adj_type = adj_type
-        if self.adj_type == 'dppm':
-            self.embedding2d = nn.Linear(in_node_nf, hidden_nf)
-            self.embedding_out2d = nn.Linear(hidden_nf, out_node_nf)
-            self.channel_num = 2
-            
-
-            gin0 = GIN([hidden_nf+self.channel_num*2], dropout_p=0.0, out_dim=hidden_nf, use_norm_layers=False, channel_num=self.channel_num)
-            self.edge_models = EdgeDensePredictionGNNLayer(gin0, c_in = self.channel_num, c_out = self.channel_num, num_classes=None)
-            
-            self.final_read_score = MLP(input_dim=2*2, output_dim=1, activate_func=nn.functional.elu,
-                                    hidden_dim=4, num_layers=3, num_classes=None)
-            
-            
-        elif self.adj_type == 'digress':            
-            self.transformer = GraphTransformer(n_layers=2, in_node_nf=5, in_edge_nf=2, in_y_nf=11,
-                                                hidden_node_mlp=256, hidden_edge_mlp=128, hidden_y_mlp=128,
-                                                hidden_node_nf=256, hidden_edge_nf=64, hidden_y_nf=64, n_head=8, ff_node_nf=256, ff_edge_nf=128,
-                                                out_node_nf=1, out_edge_nf=2, out_y_nf=0, act_fn=act_fn)
-
-        
-        self.equivariant = EGNNetwork(in_node_nf, hidden_nf, edge_feat_nf=edge_feat_nf, device=device,
-                                      act_fn=act_fn, n_layers=inv_sublayers,
-                                      attention=attention, norm_diff=norm_diff, tanh=tanh,
-                                      coords_range=coords_range, norm_constant=norm_constant,
-                                      sin_embedding=self.sin_embedding,
-                                      normalization_factor=self.normalization_factor,
-                                      aggregation_method=self.aggregation_method)
-        
-
-        self.to(self.device)
-
-    def forward(self, h, x, edge_index, bs, n_nodes, h_2d=None, y_2d=None, adjs=None, node_mask=None, edge_mask=None, compute_adj=True):
-        # Edit Emiel: Remove velocity as input
-        distances, _ = coord2diff(x, edge_index)
-        if self.sin_embedding is not None:
-            distances = self.sin_embedding(distances)
-        
-        if self.adj_type == 'dppm':
-            if compute_adj:
-                ori_adjs = edge_mask.view(bs, n_nodes, n_nodes).unsqueeze(1)
-                adjs = torch.cat([ori_adjs, 1. - ori_adjs], dim=1)  # B x 2 x N x N
-                adjs = mask_adjs(adjs, node_mask.view(bs, n_nodes))
-                temp_adjs = [adjs]
-                h_2d = self.embedding2d(h.view(bs, n_nodes, self.in_node_nf))
-                h_2d, adjs = self.edge_models(h_2d, adjs, node_mask.view(bs, n_nodes))
-                temp_adjs.append(adjs)
-                
-        elif self.adj_type == 'digress':
-            h_2d, pred_adjs, y_2d = self.transformer(h_2d, adjs, y_2d, node_mask, edge_mask)
-            
-            if node_mask is not None:
-                h_2d = h_2d * node_mask.view(bs, n_nodes, 1)
-                pred_adjs = pred_adjs * edge_mask.view(bs, n_nodes, n_nodes, 1)
-
-            
-        h_3d, x = self.equivariant(h, x, edge_index, node_mask=node_mask, edge_mask=edge_mask, edge_attr=distances)
-            
-        if node_mask is not None:
-            h_3d = h_3d * node_mask
-            
-            
-        if self.adj_type == 'dppm':
-            if compute_adj:
-                stacked_adjs = torch.cat(temp_adjs, dim=1)
-                mlp_in = stacked_adjs.permute(0, 2, 3, 1)
-                out_shape = mlp_in.shape[:-1]
-                mlp_out = self.final_read_score(mlp_in)
-                score = mlp_out.view(*out_shape)
-                return h_3d, x, score
-            
-        elif self.adj_type == 'digress':
-            return h_3d, x, pred_adjs
-        
-        return h_3d, x, None
-
-    
-class EGNNetwork(nn.Module):
-    def __init__(self, in_node_nf, hidden_nf, edge_feat_nf=2, device='cpu', act_fn=nn.SiLU(), n_layers=3, attention=False,
-                 norm_diff=True, out_node_nf=None, tanh=False, coords_range=15, norm_constant=1, inv_sublayers=2,
                  sin_embedding=False, normalization_factor=100, aggregation_method='sum'):
-        super().__init__()
+        super(EGNN, self).__init__()
         if out_node_nf is None:
             out_node_nf = in_node_nf
-            
         self.hidden_nf = hidden_nf
         self.device = device
         self.n_layers = n_layers
@@ -263,20 +162,15 @@ class EGNNetwork(nn.Module):
         self.normalization_factor = normalization_factor
         self.aggregation_method = aggregation_method
 
-        self.embedding_in = nn.Sequential(nn.Linear(in_node_nf, hidden_nf), act_fn,
-                                      nn.Linear(hidden_nf, hidden_nf), act_fn)
-        
-        self.embedding_out = nn.Sequential(nn.Linear(hidden_nf, hidden_nf), act_fn,
-                                       nn.Linear(hidden_nf, out_node_nf))
-        
         if sin_embedding:
             self.sin_embedding = SinusoidsEmbeddingNew()
             edge_feat_nf = self.sin_embedding.dim * 2
         else:
             self.sin_embedding = None
             edge_feat_nf = 2
-            
-        
+
+        self.embedding = nn.Linear(in_node_nf, self.hidden_nf)
+        self.embedding_out = nn.Linear(self.hidden_nf, out_node_nf)
         for i in range(0, n_layers):
             self.add_module("e_block_%d" % i, EquivariantBlock(hidden_nf, edge_feat_nf=edge_feat_nf, device=device,
                                                                act_fn=act_fn, n_layers=inv_sublayers,
@@ -285,43 +179,24 @@ class EGNNetwork(nn.Module):
                                                                sin_embedding=self.sin_embedding,
                                                                normalization_factor=self.normalization_factor,
                                                                aggregation_method=self.aggregation_method))
+        self.to(self.device)
 
-    def forward(self, h, x, edge_index, node_mask=None, edge_mask=None, edge_attr=None):
-        
-        h = self.embedding_in(h)
+    def forward(self, h, x, edge_index, node_mask=None, edge_mask=None):
+        # Edit Emiel: Remove velocity as input
+        distances, _ = coord2diff(x, edge_index)
+        if self.sin_embedding is not None:
+            distances = self.sin_embedding(distances)
+        h = self.embedding(h)
         for i in range(0, self.n_layers):
-            h, x = self._modules["e_block_%d" % i](h, x, edge_index, node_mask=node_mask, edge_mask=edge_mask, edge_attr=edge_attr)
-            
+            h, x = self._modules["e_block_%d" % i](h, x, edge_index, node_mask=node_mask, edge_mask=edge_mask, edge_attr=distances)
+
+        # Important, the bias of the last linear might be non-zero
         h = self.embedding_out(h)
+        if node_mask is not None:
+            h = h * node_mask
         return h, x
-    
-    
-class EdgeDensePredictionGNNLayer(nn.Module):
-    def __init__(self, gnn_module, c_in, c_out,
-                 num_classes=1):
-        super().__init__()
-        self.multi_channel_gnn_module = gnn_module
-        self.translate_mlp = MLP(num_layers=3, input_dim=c_in + 2 * gnn_module.get_out_dim(),
-                                 hidden_dim=max(c_in, c_out) * 2, output_dim=c_out,
-                                 activate_func=nn.functional.elu,
-                                 use_bn=True,
-                                 num_classes=num_classes)
 
-    def forward(self, x, adjs, node_flags):
-        x_o = self.multi_channel_gnn_module(x, adjs, node_flags)  # B x N x F_o
-        x_o_pair = node_feature_to_matrix(x_o)  # B x N x N x 2F_o
-        last_c_adjs = adjs.permute(0, 2, 3, 1)  # B x N x N x C_i
-        mlp_in = torch.cat([last_c_adjs, x_o_pair], dim=-1)  # B x N x N x (2F_o+C_i)
-        mlp_in_shape = mlp_in.shape
-        mlp_out = self.translate_mlp(mlp_in.view(-1, mlp_in_shape[-1]))
-        new_adjs = mlp_out.view(mlp_in_shape[0], mlp_in_shape[1], mlp_in_shape[2], -1).permute(0, 3, 1, 2)
-        new_adjs = new_adjs + new_adjs.transpose(-1, -2)
-        # new_adjs = torch.sigmoid(new_adjs)
-        new_adjs = mask_adjs(new_adjs, node_flags)
-        return x_o, new_adjs
-    
 
-    
 class GNN(nn.Module):
     def __init__(self, in_node_nf, in_edge_nf, hidden_nf, aggregation_method='sum', device='cpu',
                  act_fn=nn.SiLU(), n_layers=4, attention=False,

@@ -18,7 +18,7 @@ import torch
 import time
 import pickle
 from qm9.utils import prepare_context, compute_mean_mad
-from train_test import train_epoch, test, analyze_and_save
+from train_test_no3d import train_epoch, test, analyze_and_save
 
 from torch.nn.parallel import DistributedDataParallel
 import torch.distributed as dist
@@ -365,7 +365,7 @@ def main(local_rank):
 
     
     # Retrieve QM9 dataloaders
-    dataloaders, charge_scale, train_sampler = dataset.retrieve_dataloaders(args)
+    dataloaders, charge_scale, train_sampler = dataset.retrieve_dataloaders(args, use3d=False)
 
     data_dummy = next(iter(dataloaders['train']))
     prop_dist = get_prop_dist(args, dataloaders['train'])
@@ -389,20 +389,19 @@ def main(local_rank):
         print(f"Epoch took {time.time() - start_epoch:.1f} seconds.")
 
         if epoch % args.test_epochs == 0:
-            if rank == 0 and local_rank == 0:
-                if not args.break_train_epoch:
-                    analyze_and_save(args=args, epoch=epoch, model_sample=model_ema, nodes_dist=nodes_dist,
-                                    dataset_info=dataset_info, device=device,
-                                    prop_dist=prop_dist, n_samples=args.n_stability_samples)
-                    
-                nll_val = test(args=args, loader=dataloaders['valid'], epoch=epoch, eval_model=model_ema_dp,
-                            partition='Val', device=device, dtype=dtype, nodes_dist=nodes_dist,
-                            property_norms=property_norms, rank=rank, local_rank=local_rank)
+
+            if not args.break_train_epoch:
+                analyze_and_save(args=args, epoch=epoch, model_sample=model_ema, nodes_dist=nodes_dist,
+                                 dataset_info=dataset_info, device=device,
+                                 prop_dist=prop_dist, n_samples=args.n_stability_samples)
                 
-                nll_test = test(args=args, loader=dataloaders['test'], epoch=epoch, eval_model=model_ema_dp,
-                                partition='Test', device=device, dtype=dtype,
-                                nodes_dist=nodes_dist, property_norms=property_norms, rank=rank, local_rank=local_rank)
-                                
+            nll_val = test(args=args, loader=dataloaders['valid'], epoch=epoch, eval_model=model_ema_dp,
+                           partition='Val', device=device, dtype=dtype, nodes_dist=nodes_dist,
+                           property_norms=property_norms, rank=rank, local_rank=local_rank)
+            
+            nll_test = test(args=args, loader=dataloaders['test'], epoch=epoch, eval_model=model_ema_dp,
+                            partition='Test', device=device, dtype=dtype,
+                            nodes_dist=nodes_dist, property_norms=property_norms, rank=rank, local_rank=local_rank)
 
             if rank == 0 and local_rank == 0:
                 if nll_val < best_nll_val:

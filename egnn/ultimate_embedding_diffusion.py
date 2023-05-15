@@ -164,7 +164,8 @@ class CombineEmbedding(nn.Module):
             
         if (x_2d_neighbor is not None) and (x_3d_neighbor is None):
             if self.neighbor_combine_embedding == 'cat':
-                x[:, 1:, :] = self.combine(torch.cat([x[:, 1:, :], x_2d_neighbor], dim=-1))
+                padding = (0, self.hidden_dim)
+                x[:, 1:, :] = self.combine(torch.cat([F.pad(x[:, 1:, :], padding, value=0).to(x.device), x_2d_neighbor], dim=-1))
                 
             elif self.neighbor_combine_embedding == 'add':
                 x[:, 1:, :] = x[:, 1:, :] + x_2d_neighbor
@@ -396,7 +397,6 @@ class MoleculeNeighbor2DEmbedding(torch_geometric.nn.MessagePassing):
         edge_weight = self.edge_encoder(edge_feature) * adj.unsqueeze(-1)
         edge_weight = edge_weight[edge_weight != 0].view(-1, self.hidden_dim)
 
-        
         x_neighbors = self.propagate(edge_index, x=node_feature.view(-1, self.hidden_dim), W=edge_weight, size=None)
         x_neighbors = x_neighbors.view(bs, n_nodes, self.hidden_dim)
                 
@@ -441,8 +441,10 @@ class Molecule3DBias(nn.Module):
 
         padding_mask = node_features.eq(0).all(dim=-1)
         n_graph, n_node, _ = pos.shape
-        delta_pos = pos.unsqueeze(1) - pos.unsqueeze(2)
-        dist = delta_pos.norm(dim=-1).view(-1, n_node, n_node)
+
+        delta_pos = pos.unsqueeze(2) - pos.unsqueeze(1)
+        radial = torch.sum(delta_pos**2, -1)#.unsqueeze(-1)
+        dist = torch.sqrt(radial)
         dist = torch.nan_to_num(dist)
 
 
@@ -507,9 +509,13 @@ class MoleculeNeighbor3DEmbedding(torch_geometric.nn.MessagePassing):
         node_feature = node_atom_feature
         
 
-        edge_vec = pos.unsqueeze(1) - pos.unsqueeze(2)
-        dist = edge_vec.norm(dim=-1).view(-1, n_nodes, n_nodes)
-        dist = torch.nan_to_num(dist)
+        # edge_vec = pos.unsqueeze(1) - pos.unsqueeze(2)
+        # dist = edge_vec.norm(dim=-1).view(-1, n_nodes, n_nodes)
+        # dist = torch.nan_to_num(dist)
+        
+        delta_pos = pos.unsqueeze(2) - pos.unsqueeze(1)
+        radial = torch.sum(delta_pos**2, -1)
+        dist = torch.sqrt(radial)
         
         cutoffs = 0.5 * (torch.cos(dist * math.pi / self.cutoff_upper) + 1.0)
         cutoffs = cutoffs * (dist < self.cutoff_upper).float() * (dist > self.cutoff_lower).float()
@@ -564,9 +570,9 @@ class GeometricInformation(nn.Module):
         
         bs, n_nodes = pos.size()[:2]
             
-        edge_vec = pos.unsqueeze(1) - pos.unsqueeze(2)
-        dist = edge_vec.norm(dim=-1).view(-1, n_nodes, n_nodes)
-        dist = torch.nan_to_num(dist)
+        delta_pos = pos.unsqueeze(2) - pos.unsqueeze(1)
+        radial = torch.sum(delta_pos**2, -1)
+        dist = torch.sqrt(radial)
         
         cutoffs = 0.5 * (torch.cos(dist * math.pi / self.cutoff_upper) + 1.0)
         cutoffs = cutoffs * (dist < self.cutoff_upper).float() * (dist > self.cutoff_lower).float()
@@ -584,8 +590,8 @@ class GeometricInformation(nn.Module):
             edge_feature = self.dist_proj(dist, torch.zeros_like(dist).long())
             
         
-        edge_vec = edge_vec / torch.norm(edge_vec, dim=-1).unsqueeze(-1)      
-        edge_vec = torch.nan_to_num(edge_vec)
+        norm = dist.detach() + 1e-10
+        delta_pos = delta_pos/norm.unsqueeze(-1)
         
-        return edge_index, edge_feature, edge_vec, cutoffs
+        return edge_index, edge_feature, delta_pos, cutoffs
         

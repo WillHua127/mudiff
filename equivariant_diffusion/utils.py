@@ -6,6 +6,7 @@ pyximport.install(setup_args={"script_args" : ["--verbose"]})
 import algos
 
 
+
 class EMA():
     def __init__(self, beta):
         super().__init__()
@@ -144,60 +145,27 @@ def sample_gaussian_with_mask(size, device, node_mask):
     return x_masked
 
 
-def mask_distributions(true_E, pred_E, edge_mask):
-    # Set masked rows to arbitrary distributions, so it doesn't contribute to loss
-    row_E = torch.zeros(true_E.size(-1), dtype=torch.float, device=true_E.device)
-    row_E[0] = 1.
+def get_spatial_positions(edges, edge_mask, spatial, device):
 
-    diag_mask = ~torch.eye(edge_mask.size(1), device=edge_mask.device, dtype=torch.bool).unsqueeze(0)
+    spatial_positions = []
     
-    true_E[~(edge_mask * diag_mask), :] = row_E
-    pred_E[~(edge_mask * diag_mask), :] = row_E
-
-    return true_E, pred_E
-
-
-def sum_except_batch(x):
-    return x.reshape(x.size(0), -1).sum(dim=-1)
+    for (adj, mask) in zip(edges, edge_mask):
+        mask = mask.clone().detach().cpu().numpy()
+        shortest_path_result, _ = algos.floyd_warshall(adj.clone().detach().cpu().numpy())
+        shortest_path_result = shortest_path_result# * mask
+        spatial_pos = torch.from_numpy((shortest_path_result))
 
 
+        spatial_positions.append(spatial_pos)
+        
+    spatial_positions = torch.stack(spatial_positions)    
+    spatial_positions[spatial_positions > spatial] = spatial
 
-def generate_noise_adjs(org_adj, edge_mask, sigma, bs, n_nodes, device='cpu'):
-    assert bs == sigma.shape[0]
+    spatial_positions = spatial_positions.to(device)# * edge_mask
     
-    sigma = sigma.squeeze()
-    org_adj = org_adj.to(device)
-    ##if Aij=1 then chances for being 1 later is 1-sigma so chance of changing is sigma
-    bernoulli_adj = [torch.where(org_adj[i]>1/2, torch.full_like(org_adj[i], 1-sigma[i]).to(device), torch.full_like(org_adj[i], sigma[i]).to(device)) for i in range(bs)]
-    bernoulli_adj = torch.cat(bernoulli_adj, dim=0).view_as(org_adj)
-
-    noise_upper = torch.bernoulli(bernoulli_adj).triu(diagonal=1)
-    noise_lower = noise_upper.transpose(-1, -2)
-    grad_log_noise = torch.abs(-org_adj + noise_upper + noise_lower)
-    noisy_adj = noise_upper + noise_lower
-
-    noisy_adj = noisy_adj * edge_mask.view_as(org_adj)
-    grad_log_noise = grad_log_noise * edge_mask.view_as(org_adj)
-    return noisy_adj, grad_log_noise
+    return spatial_positions.long()
 
 
-def mask_adjs(adjs, node_flags):
-    # assert node_flags.sum(-1).gt(2-1e-5).all(), f"{node_flags.sum(-1).cpu().numpy()}, {adjs.cpu().numpy()}"
-    if len(adjs.shape) == 4:
-        node_flags = node_flags.unsqueeze(1)  # B x 1 x N
-    adjs = adjs * node_flags.unsqueeze(-1)
-    adjs = adjs * node_flags.unsqueeze(-2)
-    return adjs
-
-
-def node_feature_to_matrix(x):
-    x_b = x.unsqueeze(-2).expand(-1, -1, x.size(1), -1)  # BS x N x N x F
-    x_b_t = x_b.transpose(1, 2)  # BS x N x N x F
-    x_pair = torch.cat([x_b, x_b_t], dim=-1)  # BS x N x N x 2F
-    return x_pair
-
-
-    
 def sample_discrete_features(probE, edge_mask):
     ''' Sample features from multinomial distribution with given probabilities
         :param probE: bs, n, n, de_out     edge features
@@ -213,34 +181,55 @@ def sample_discrete_features(probE, edge_mask):
     probE = probE.reshape(probE.size(0) * probE.size(1) * probE.size(2), -1)    # (bs * n * n, de_out)
 
     # Sample E
-    #E_t = probE.multinomial(1).view_as(edge_mask)   # (bs, n, n)
-    E_t = probE.argmax(1).view_as(edge_mask)   # (bs, n, n)
+    E_t = probE.multinomial(1).view_as(edge_mask)   # (bs, n, n)
+    #E_t = probE.argmax(1).view_as(edge_mask)   # (bs, n, n)
     E_t = torch.triu(E_t, diagonal=1)
     E_t = (E_t + torch.transpose(E_t, 1, 2))
 
     return E_t
 
 
-def get_spatial_positions(edge_attr, edge_mask, spatial, device):
+def mask_distributions(true_E, pred_E, edge_mask):
+    # Set masked rows to arbitrary distributions, so it doesn't contribute to loss
+    row_E = torch.zeros(true_E.size(-1), dtype=torch.float, device=true_E.device)
+    row_E[0] = 1.
 
-    spatial_positions = []
+    diag_mask = ~torch.eye(edge_mask.size(1), device=edge_mask.device, dtype=torch.bool).unsqueeze(0)
     
-    for (adj, mask) in zip(edge_attr, edge_mask):
-        mask = mask.clone().detach().cpu().numpy()
-        shortest_path_result, _ = algos.floyd_warshall(adj.sum(-1).long().clone().detach().cpu().numpy())
-        shortest_path_result = shortest_path_result# * mask
-        spatial_pos = torch.from_numpy((shortest_path_result))
+    true_E[~(edge_mask * diag_mask), :] = row_E
+    pred_E[~(edge_mask * diag_mask), :] = row_E
+
+    return true_E, pred_E
 
 
-        spatial_positions.append(spatial_pos)
-        
-    spatial_positions = torch.stack(spatial_positions)    
-    spatial_positions[spatial_positions > spatial] = spatial
+def posterior_distributions(E, E_t, Qt, Qsb, Qtb):
+    prob_E = compute_posterior_distribution(M=E, M_t=E_t, Qt_M=Qt, Qsb_M=Qsb, Qtb_M=Qtb)   # (bs, n * n, de)
 
-    spatial_positions = spatial_positions.to(device)# * edge_mask
-    
-    return spatial_positions.long()
+    return prob_E
 
+
+def compute_posterior_distribution(M, M_t, Qt_M, Qsb_M, Qtb_M):
+    ''' M: X or E
+        Compute xt @ Qt.T * x0 @ Qsb / x0 @ Qtb @ xt.T
+    '''
+    # Flatten feature tensors
+    M = M.flatten(start_dim=1, end_dim=-2).to(torch.float32)        # (bs, N, d) with N = n or n * n
+    M_t = M_t.flatten(start_dim=1, end_dim=-2).to(torch.float32)    # same
+
+    Qt_M_T = torch.transpose(Qt_M, -2, -1)      # (bs, d, d)
+
+    left_term = M_t @ Qt_M_T   # (bs, N, d)
+    right_term = M @ Qsb_M     # (bs, N, d)
+    product = left_term * right_term    # (bs, N, d)
+
+    denom = M @ Qtb_M     # (bs, N, d) @ (bs, d, d) = (bs, N, d)
+    denom = (denom * M_t).sum(dim=-1)   # (bs, N, d) * (bs, N, d) + sum = (bs, N)
+    # denom = product.sum(dim=-1)
+    # denom[denom == 0.] = 1
+
+    prob = product / denom.unsqueeze(-1)    # (bs, N, d)
+
+    return prob
 
 
 def compute_batched_over0_posterior_distribution(X_t, Qt, Qsb, Qtb):
@@ -272,33 +261,3 @@ def compute_batched_over0_posterior_distribution(X_t, Qt, Qsb, Qtb):
 
     out = numerator / denominator
     return out
-
-
-def posterior_distributions(E, E_t, Qt, Qsb, Qtb):
-    prob_E = compute_posterior_distribution(M=E, M_t=E_t, Qt_M=Qt, Qsb_M=Qsb, Qtb_M=Qtb)   # (bs, n * n, de)
-
-    return prob_E
-
-
-def compute_posterior_distribution(M, M_t, Qt_M, Qsb_M, Qtb_M):
-    ''' M: X or E
-        Compute xt @ Qt.T * x0 @ Qsb / x0 @ Qtb @ xt.T
-    '''
-    # Flatten feature tensors
-    M = M.flatten(start_dim=1, end_dim=-2).to(torch.float32)        # (bs, N, d) with N = n or n * n
-    M_t = M_t.flatten(start_dim=1, end_dim=-2).to(torch.float32)    # same
-
-    Qt_M_T = torch.transpose(Qt_M, -2, -1)      # (bs, d, d)
-
-    left_term = M_t @ Qt_M_T   # (bs, N, d)
-    right_term = M @ Qsb_M     # (bs, N, d)
-    product = left_term * right_term    # (bs, N, d)
-
-    denom = M @ Qtb_M     # (bs, N, d) @ (bs, d, d) = (bs, N, d)
-    denom = (denom * M_t).sum(dim=-1)   # (bs, N, d) * (bs, N, d) + sum = (bs, N)
-    # denom = product.sum(dim=-1)
-    # denom[denom == 0.] = 1
-
-    prob = product / denom.unsqueeze(-1)    # (bs, N, d)
-
-    return prob

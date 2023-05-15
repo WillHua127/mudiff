@@ -118,7 +118,7 @@ class TransformerEncoder(nn.Module):
         self.graph_embedding = ExtraGraphFeatureEmebedding(
             max_n_nodes=max_n_nodes,
             max_weight=max_weight,
-            atom_weights=None,
+            atom_weights=atom_weights,
             extra_feature_type=extra_feature_type,
             graph_hidden_dim=graph_embedding_dim,
             n_layers=num_encoder_layers,
@@ -413,8 +413,8 @@ class TransformerEncoder(nn.Module):
         
         ### Preparing padding mask
         padding_mask = (node_mask==0).squeeze(-1) # B x T x 1
-        padding_mask_cls = torch.zeros(bs, 1, device=padding_mask.device, dtype=padding_mask.dtype)
-        padding_mask = torch.cat((padding_mask_cls, padding_mask), dim=1)
+        #padding_mask_cls = torch.zeros(bs, 1, device=padding_mask.device, dtype=padding_mask.dtype)
+        #padding_mask = torch.cat((padding_mask_cls, padding_mask), dim=1)
         
         
         attn_mask = None
@@ -428,14 +428,13 @@ class TransformerEncoder(nn.Module):
         ### A.2 Obtaining (2d) attention biases
         attn_bias = self.molecule_attn_bias(node_features, attn_bias, spatial_pos, edge_input, edge_type)
 
-        
         ### A.3 Obtaining (3d) attention biases & Encoding (with 3d information)
         delta_pos = None
         if (self.molecule_3d_bias is not None) and not (pos == 0).all():
             attn_bias_3d, merged_edge_features, delta_pos = self.molecule_3d_bias(node_features, pos)
 
             attn_bias[:, :, 1:, 1:] = attn_bias[:, :, 1:, 1:] + attn_bias_3d
-            x[:, 1:, :] = x[:, 1:, :] + merged_edge_features * 0.01
+            #x[:, 1:, :] = x[:, 1:, :] + merged_edge_features * 0.01
 
             
         ### A.4 Encoding (with 2d neighborhood information)
@@ -479,13 +478,15 @@ class TransformerEncoder(nn.Module):
             x = self.before_dropout(x)
             
         if node_mask is not None:
-            x[:, 1:, :] = x[:, 1:, :] * node_mask
+            #x[:, 1:, :] = x[:, 1:, :] * node_mask
+            x = x[:, 1:, :] * node_mask
             
         if (edge_mask is not None) and (encoded_adj is not None):
             encoded_adj = encoded_adj * edge_mask
                     
         if attn_bias is not None:
-            attn_bias = attn_bias.contiguous().permute(0, 2, 3, 1)
+            attn_bias = attn_bias.contiguous().permute(0, 2, 3, 1)[:, 1:, 1:, :]
+            #attn_bias = attn_bias.contiguous().permute(0, 2, 3, 1)
 
             
         edge_index_3d, edge_feature_3d, edge_direction_3d, cutoff_3d, velocity = None, None, None, None, None
@@ -507,9 +508,10 @@ class TransformerEncoder(nn.Module):
 
                     assert velocity.shape[-1] == x.shape[-1]
 
-                    dx, dvec, _ = self.transformer_3d_layers[i](x[:, 1:, :], velocity, edge_index=edge_index_3d, edge_feature=edge_feature_3d, edge_direction=edge_direction_3d, cutoff=cutoff_3d, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
+                    dx, dvec, _ = self.transformer_3d_layers[i](x, velocity, edge_index=edge_index_3d, edge_feature=edge_feature_3d, edge_direction=edge_direction_3d, cutoff=cutoff_3d, node_mask=node_mask, self_attn_padding_mask=(node_features[:,:,0]==0), self_attn_mask=attn_mask)
 
-                    x[:, 1:, :] = x[:, 1:, :] + dx
+                    #x[:, 1:, :] = x[:, 1:, :] + dx
+                    x = x + dx
                     velocity = velocity + dvec
                     
                    
@@ -517,7 +519,7 @@ class TransformerEncoder(nn.Module):
         ####################################################################################            
         if self.combine_transformer_output in {'add'}:
             
-            x_3d = x[:, 1:, :]
+            x_3d = x
             for i in range(0, self.num_layers):
                 x, _, encoded_adj, graph_feature = self.transformer_2d_layers[i](x, adj=encoded_adj, graph_feature=graph_feature, node_mask=node_mask, edge_mask=edge_mask, self_attn_padding_mask=padding_mask, self_attn_mask=attn_mask, self_attn_bias=attn_bias)
 
@@ -531,15 +533,15 @@ class TransformerEncoder(nn.Module):
                     x_3d = x_3d + dx
                     velocity = velocity + dvec
                     
-                    x[:, 1:, :] = x[:, 1:, :] + x_3d
+                    x = x + x_3d
                     
-                    x_3d = x[:, 1:, :]
+                    x_3d = x
                     
                     
         ####################################################################################            
         if self.combine_transformer_output in {'cat'}:
             
-            x_3d = x[:, 1:, :]
+            x_3d = x
             for i in range(0, self.num_layers):
                 x, _, encoded_adj, graph_feature = self.transformer_2d_layers[i](x, adj=encoded_adj, graph_feature=graph_feature, node_mask=node_mask, edge_mask=edge_mask, self_attn_padding_mask=padding_mask, self_attn_mask=attn_mask, self_attn_bias=attn_bias)
 
@@ -552,15 +554,15 @@ class TransformerEncoder(nn.Module):
 
                     x_3d = x_3d + dx
                     velocity = velocity + dvec
-                    x[:, 1:, :] = self.combine_proj(torch.cat([x[:, 1:, :], x_3d], dim=-1))
+                    x = self.combine_proj(torch.cat([x, x_3d], dim=-1))
                     
-                    x_3d = x[:, 1:, :]
+                    x_3d = x
                     
                     
         ####################################################################################            
         if self.combine_transformer_output in {'cat_last'}:
             
-            x_3d = x[:, 1:, :]
+            x_3d = x
             for i in range(0, self.num_layers):
                 x, _, encoded_adj, graph_feature = self.transformer_2d_layers[i](x, adj=encoded_adj, graph_feature=graph_feature, node_mask=node_mask, edge_mask=edge_mask, self_attn_padding_mask=padding_mask, self_attn_mask=attn_mask, self_attn_bias=attn_bias)
 
@@ -576,14 +578,14 @@ class TransformerEncoder(nn.Module):
                     
                 
             if (self.transformer_3d_layers is not None) and (velocity is not None):
-                x[:, 1:, :] = self.combine_proj(torch.cat([x[:, 1:, :], x_3d], dim=-1))
+                x = self.combine_proj(torch.cat([x, x_3d], dim=-1))
                     
                 
                     
         x_out = x
         pos_out = None
         if (self.equivariant_output is not None) and (not (pos == 0).all()) and (velocity is not None):
-            x_out[:, 1:, :], v_out = self.equivariant_output(x[:, 1:, :], velocity)
+            x_out, v_out = self.equivariant_output(x, velocity)
             pos_out = v_out.squeeze() + pos
             
         else:
@@ -594,7 +596,7 @@ class TransformerEncoder(nn.Module):
             if self.out_node_proj is not None:
                 x_out = self.out_node_proj(x)
             
-        x_out[:, 1:, :] = x_out[:, 1:, :] * node_mask
+        x_out = x_out * node_mask
         
         if pos_out is not None:
             pos_out = pos_out * node_mask
@@ -612,4 +614,4 @@ class TransformerEncoder(nn.Module):
             
             
         
-        return x_out[:, 1:, :], adj_out, pos_out
+        return x_out, adj_out, pos_out

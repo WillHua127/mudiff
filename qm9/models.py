@@ -3,11 +3,10 @@ import torch.nn as nn
 from torch.distributions.categorical import Categorical
 
 import numpy as np
-#from egnn.models import EGNN_dynamics_QM9
+from egnn.models import Transformer_dynamics
 
-from equivariant_diffusion.en_diffusion import EnVariationalDiffusion
+from equivariant_diffusion.en_diffusion import MuDiffusion
 from egnn.ultimate_transformer_diffusion import TransformerEncoder
-from egnn.ultimate_models import Transformer_dynamics
 
 def get_prop_dist(args, dataloader_train):
     prop_dist = None
@@ -17,7 +16,7 @@ def get_prop_dist(args, dataloader_train):
     return prop_dist
 
 def get_model(args, dataset_info):
-    histogram = dataset_info['n_nodes']
+    histogram = dataset_info['n_nodes']    
     max_nodes = dataset_info['max_n_nodes']
     max_weights = dataset_info['max_weight']
     edge_types = dataset_info['edge_types']
@@ -27,6 +26,7 @@ def get_model(args, dataset_info):
     max_num_edges = dataset_info['max_num_edges']
     max_spatial = dataset_info['max_spatial']
     max_edge_dist = dataset_info['max_edge_dist']
+
     
     in_node_nf = len(dataset_info['atom_decoder']) + int(args.include_charges)
     nodes_dist = DistributionNodes(histogram)
@@ -38,16 +38,9 @@ def get_model(args, dataset_info):
         print('Warning: dynamics model is _not_ conditioned on time.')
         dynamics_in_node_nf = in_node_nf
 
-#     net_dynamics = EGNN_dynamics_QM9(
-#         in_node_nf=dynamics_in_node_nf, context_node_nf=args.context_node_nf,
-#         n_dims=3, device=device, hidden_nf=args.nf,
-#         act_fn=torch.nn.SiLU(), n_layers=args.n_layers,
-#         attention=args.attention, tanh=args.tanh, mode=args.model, norm_constant=args.norm_constant,
-#         inv_sublayers=args.inv_sublayers, sin_embedding=args.sin_embedding,
-#         normalization_factor=args.normalization_factor, aggregation_method=args.aggregation_method)
 
-    print(args)
     in_edge_nf = len(edge_types)
+
     transformer = TransformerEncoder(num_in_degree = max_in_deg,
                                     num_out_degree = max_out_deg,
                                     num_edges = max_num_edges,
@@ -122,19 +115,18 @@ def get_model(args, dataset_info):
                                     use_equivariant_output_projection = args.use_equivariant_output_projection,
                                     equivariant_output_activation_fn = nn.SiLU,
                                      )
+
+    net_dynamics = Transformer_dynamics(
+                        model=transformer, context_node_dim=args.context_node_nf, num_spatial=max_spatial,
+                        n_dims=3, condition_time=True
+                                        )
     
-                                      
-        
-    transformer_dynamics = Transformer_dynamics(transformer, context_node_dim=args.context_node_nf, n_dims=3, condition_time=args.condition_time)
-        
+    
     if args.probabilistic_model == 'diffusion':
-        vdm = EnVariationalDiffusion(
-            transformer_dynamics=transformer_dynamics,
+        vdm = MuDiffusion(
+            dynamics=net_dynamics,
             in_node_nf=in_node_nf,
             n_dims=3,
-            num_edge_type=in_edge_nf,
-            max_nodes=max_nodes,
-            num_spatial=max_spatial,
             timesteps=args.diffusion_steps,
             noise_schedule=args.diffusion_noise_schedule,
             noise_precision=args.diffusion_noise_precision,
@@ -142,10 +134,11 @@ def get_model(args, dataset_info):
             norm_values=args.normalize_factors,
             include_charges=args.include_charges,
             edge_types=edge_types,
+            num_edge_type = in_edge_nf,
+            transition_type = 'marginal',
             )
 
         return vdm, nodes_dist
-
 
     else:
         raise ValueError(args.probabilistic_model)

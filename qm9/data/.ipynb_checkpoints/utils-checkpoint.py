@@ -80,9 +80,20 @@ def initialize_datasets(args, datadir, dataset, subset=None, splits=None,
 
 
     fixed_perm = np.random.permutation(len(datasets['train']['num_atoms']))
-    sliced_perm = fixed_perm[0:len(datasets['train']['num_atoms']) // 10000]
+    sliced_perm = fixed_perm[0:len(datasets['train']['num_atoms']) // 1000]
     for key in datasets['train']:
             datasets['train'][key] = datasets['train'][key][sliced_perm]
+
+    fixed_perm = np.random.permutation(len(datasets['test']['num_atoms']))
+    sliced_perm = fixed_perm[0:len(datasets['test']['num_atoms']) // 100]
+    for key in datasets['test']:
+            datasets['test'][key] = datasets['test'][key][sliced_perm]
+
+    fixed_perm = np.random.permutation(len(datasets['valid']['num_atoms']))
+    sliced_perm = fixed_perm[0:len(datasets['valid']['num_atoms']) // 100]
+    for key in datasets['valid']:
+            datasets['valid'][key] = datasets['valid'][key][sliced_perm]
+
 
     # Basic error checking: Check the training/test/validation splits have the same set of keys.
     keys = [list(data.keys()) for data in datasets.values()]

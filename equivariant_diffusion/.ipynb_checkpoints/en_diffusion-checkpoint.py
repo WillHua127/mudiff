@@ -2,15 +2,10 @@ from equivariant_diffusion import utils
 import numpy as np
 import math
 import torch
-from torch import nn
 from egnn import models
 from torch.nn import functional as F
 from equivariant_diffusion import utils as diffusion_utils
 from equivariant_diffusion import transition
-from equivariant_diffusion.extra_features import DummyExtraFeatures, ExtraFeatures
-
-from egnn.ultimate_transformer_diffusion import TransformerEncoder
-from egnn.ultimate_models import Transformer_dynamics
 
 
 # Defining some useful util functions.
@@ -24,9 +19,6 @@ def softplus(x: torch.Tensor) -> torch.Tensor:
 
 def sum_except_batch(x):
     return x.view(x.size(0), -1).sum(-1)
-
-def mean_except_batch(x):
-    return x.view(x.size(0), -1).mean(-1)
 
 
 def clip_noise_schedule(alphas2, clip_value=0.001):
@@ -44,7 +36,7 @@ def clip_noise_schedule(alphas2, clip_value=0.001):
     return alphas2
 
 
-def polynomial_schedule(timesteps: int, s=1e-10, power=3.):
+def polynomial_schedule(timesteps: int, s=1e-4, power=3.):
     """
     A noise schedule based on a simple polynomial equation: 1 - x^power.
     """
@@ -52,7 +44,7 @@ def polynomial_schedule(timesteps: int, s=1e-10, power=3.):
     x = np.linspace(0, steps, steps)
     alphas2 = (1 - np.power(x / steps, power))**2
 
-    alphas2 = clip_noise_schedule(alphas2, clip_value=0.00001)
+    alphas2 = clip_noise_schedule(alphas2, clip_value=0.001)
 
     precision = 1 - 2 * s
 
@@ -78,7 +70,7 @@ def cosine_beta_schedule(timesteps, s=0.008, raise_to_power: float = 1):
     if raise_to_power != 1:
         alphas_cumprod = np.power(alphas_cumprod, raise_to_power)
 
-    return alphas_cumprod
+    return alphas_cumprod, betas
 
 
 def gaussian_entropy(mu, sigma):
@@ -185,7 +177,7 @@ class PredefinedNoiseSchedule(torch.nn.Module):
         self.timesteps = timesteps
 
         if noise_schedule == 'cosine':
-            alphas2 = cosine_beta_schedule(timesteps)
+            alphas2, betas = cosine_beta_schedule(timesteps)
         elif 'polynomial' in noise_schedule:
             splits = noise_schedule.split('_')
             assert len(splits) == 2
@@ -194,25 +186,39 @@ class PredefinedNoiseSchedule(torch.nn.Module):
         else:
             raise ValueError(noise_schedule)
 
+            
         print('alphas2', alphas2[0], alphas2[-1], len(alphas2))
+        print('betas', betas[0], betas[-1], len(betas))
 
+        
         sigmas2 = 1 - alphas2
 
         log_alphas2 = np.log(alphas2)
         log_sigmas2 = np.log(sigmas2)
 
         log_alphas2_to_sigmas2 = log_alphas2 - log_sigmas2
-
+        
         print('gamma', -log_alphas2_to_sigmas2[0], -log_alphas2_to_sigmas2[-1], len(log_alphas2_to_sigmas2))
+
 
         self.gamma = torch.nn.Parameter(
             torch.from_numpy(-log_alphas2_to_sigmas2).float(),
             requires_grad=False)
         
-
+        
+        self.beta = torch.nn.Parameter(
+            torch.from_numpy(betas).float(),
+            requires_grad=False)
+        
+        
     def forward(self, t):
         t_int = torch.round(t * self.timesteps).long()
         return self.gamma[t_int]
+    
+    
+    def get_beta(self, t):
+        t_int = torch.round(t * self.timesteps).long()
+        return self.beta[t_int]
 
 
 class GammaNetwork(torch.nn.Module):
@@ -259,16 +265,14 @@ def cdf_standard_gaussian(x):
     return 0.5 * (1. + torch.erf(x / math.sqrt(2)))
 
 
-class EnVariationalDiffusion(torch.nn.Module):
-    """
-    The E(n) Diffusion Module.
-    """
+class MuDiffusion(torch.nn.Module):
+
     def __init__(
             self,
-            transformer_dynamics: Transformer_dynamics , in_node_nf: int, n_dims: int, max_nodes: int = 29, num_edge_type=5,
-            timesteps: int = 1000, parametrization='eps', noise_schedule='learned',
-            noise_precision=1e-8, loss_type='vlb', norm_values=(1., 1., 1.),
-            norm_biases=(None, 0., 0.), transition_type='marginal', include_charges=True, edge_types=None):
+            dynamics: models.Transformer_dynamics, in_node_nf: int, n_dims: int,
+            timesteps: int = 1000, parametrization='eps', noise_schedule='cosine',
+            noise_precision=1e-4, loss_type='l2', norm_values=(1., 1., 1.),
+            norm_biases=(None, 0., 0.), include_charges=True, transition_type = 'marginal', edge_types=None, num_edge_type=4):
         super().__init__()
 
         assert loss_type in {'vlb', 'l2'}
@@ -286,14 +290,17 @@ class EnVariationalDiffusion(torch.nn.Module):
         else:
             self.gamma = PredefinedNoiseSchedule(noise_schedule, timesteps=timesteps,
                                                  precision=noise_precision)
+
             
-
-        self.edge_bce = torch.nn.BCEWithLogitsLoss()
+            
+        self.transition_type = transition_type
+        self.edge_types = edge_types
         self.num_edge_type = num_edge_type
-
+        
         if transition_type == 'uniform':
             self.transition_model = transition.DiscreteUniformTransition(e_classes=num_edge_type)
             self.e_limit = torch.ones(num_edge_type) / num_edge_type
+            
         elif transition_type == 'marginal':
             edge_types = torch.tensor(edge_types)
             e_marginals = edge_types / torch.sum(edge_types)
@@ -301,9 +308,11 @@ class EnVariationalDiffusion(torch.nn.Module):
             self.e_limit = e_marginals
             
             
-        # The network that will predict the denoising    
+            
+        self.edge_loss = torch.nn.CrossEntropyLoss(reduction='mean')
         
-        self.transformer_dynamics = transformer_dynamics
+        # The network that will predict the denoising.
+        self.dynamics = dynamics
 
         self.in_node_nf = in_node_nf
         self.n_dims = n_dims
@@ -334,6 +343,10 @@ class EnVariationalDiffusion(torch.nn.Module):
                 f'large with sigma_0 {sigma_0:.5f} and '
                 f'1 / norm_value = {1. / max_norm_value}')
 
+    def phi(self, x, edges, t, attn_bias, node_mask, edge_mask, context):
+        net_out = self.dynamics._forward(t, x, edges, attn_bias, node_mask, edge_mask, context)
+
+        return net_out
 
     def inflate_batch_array(self, array, target):
         """
@@ -423,36 +436,6 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         return sigma2_t_given_s, sigma_t_given_s, alpha_t_given_s
 
-    
-    def kl_prior_adjacency(self, E, edge_mask):
-        """Computes the KL between q(z1 | x) and the prior p(z1) = Normal(0, 1).
-
-        This is essentially a lot of work for something that is in practice negligible in the loss. However, you
-        compute it so that you see it when you've made a mistake in your noise schedule.
-        """
-        # Compute the last alpha value, alpha_T.
-        ones = torch.ones((E.size(0), 1), device=E.device)
-        gamma_T = self.gamma(ones)
-        alpha_T = self.alpha(gamma_T, E)
-
-        Qtb = self.transition_model.get_Qt_bar(alpha_T, device=E.device)
-
-        # Compute transition probabilities
-        probE = E @ Qtb
-        
-        bs, n = probE.shape[0], probE.shape[1]
-
-        # Make sure that masked rows do not contribute to the loss
-        limit_E = self.e_limit[None, None, None, :].expand(bs, n, n, -1).type_as(probE)
-        limit_dist_E, probE = diffusion_utils.mask_distributions(true_E=limit_E.clone(), pred_E=probE, edge_mask=edge_mask)
-        
-        kl_distance_E = F.kl_div(input=probE.log(), target=limit_dist_E, reduction='none')
-        kl_distance_E = kl_distance_E * edge_mask.unsqueeze(-1)
-        kl_loss = mean_except_batch(kl_distance_E)
-
-        return kl_loss
-    
-    
     def kl_prior(self, xh, node_mask):
         """Computes the KL between q(z1 | x) and the prior p(z1) = Normal(0, 1).
 
@@ -523,23 +506,17 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         return degrees_of_freedom_x * (- log_sigma_x - 0.5 * np.log(2 * np.pi))
 
-    def sample_p_xh_given_z0(self, z0, adj0, attn_bias, node_mask, edge_mask, context, fix_noise=False):
+    def sample_p_xh_given_z0(self, z0, edges, attn_bias, node_mask, edge_mask, context, fix_noise=False):
         """Samples x ~ p(x|z0)."""
         zeros = torch.zeros(size=(z0.size(0), 1), device=z0.device)
         gamma_0 = self.gamma(zeros)
         # Computes sqrt(sigma_0^2 / alpha_0^2)
         sigma_x = self.SNR(-0.5 * gamma_0).unsqueeze(1)
-        
-        spatial_pos = diffusion_utils.get_spatial_positions(adj0, edge_mask.squeeze(), z0.device)
-        
-        net_out, pred_adj = self.phi_transformer(zeros, z0, attn_bias, spatial_pos=spatial_pos, edge_type=adj0, 
-                                                 adj=adj0[:, :, :, 1:].sum(-1).long(), 
-                                                 node_mask=node_mask, edge_mask=edge_mask, context=context,
-                                                )
-        
-        pred_adj = F.softmax(pred_adj, dim=-1)
-        pred_adj = diffusion_utils.sample_discrete_features(pred_adj, edge_mask.squeeze(-1).bool())
-        pred_graph = F.one_hot(pred_adj, num_classes=self.num_edge_type) * edge_mask        # bs, n, n, d0
+        net_out, edge_out = self.phi(z0, edges, zeros, attn_bias, node_mask, edge_mask, context)
+
+        pred_edge = F.softmax(edge_out, dim=-1)
+        pred_edge = diffusion_utils.sample_discrete_features(pred_edge, edge_mask.squeeze(-1).bool())
+        pred_graph = F.one_hot(pred_edge, num_classes=self.num_edge_type) * edge_mask        # bs, n, n, d0
         
         
         # Compute mu for p(zs | zt).
@@ -597,7 +574,6 @@ class EnVariationalDiffusion(torch.nn.Module):
             cdf_standard_gaussian((h_integer_centered + 0.5) / sigma_0_int)
             - cdf_standard_gaussian((h_integer_centered - 0.5) / sigma_0_int)
             + epsilon)
-        
         log_ph_integer = sum_except_batch(log_ph_integer * node_mask)
 
         # Centered h_cat around 1, since onehot encoded.
@@ -625,82 +601,109 @@ class EnVariationalDiffusion(torch.nn.Module):
         log_p_xh_given_z = log_p_x_given_z_without_constants + log_p_h_given_z
 
         return log_p_xh_given_z
+
+    
+    def compute_kl_prior_edge(self, edge, edge_mask):
+        """Computes the KL between q(z1 | x) and the prior p(z1) = Normal(0, 1).
+
+        This is essentially a lot of work for something that is in practice negligible in the loss. However, you
+        compute it so that you see it when you've made a mistake in your noise schedule.
+        """
+        # Compute the last alpha value, alpha_T.
+        ones = torch.ones((edge.size(0), 1), device=edge_mask.device)
+        gamma_T = self.gamma(ones)
+        alpha_T = self.alpha(gamma_T, edge)
+
+        Qtb = self.transition_model.get_Qt_bar(alpha_T, device=edge_mask.device)
+
+        # Compute transition probabilities
+        prob_edge = edge @ Qtb
+        
+        bs, n = prob_edge.shape[0], prob_edge.shape[1]
+
+        # Make sure that masked rows do not contribute to the loss
+        limit_edge = self.e_limit[None, None, None, :].expand(bs, n, n, -1).type_as(prob_edge)
+        limit_dist_edge, prob_edge = diffusion_utils.mask_distributions(true_E=limit_edge.clone(), pred_E=prob_edge, edge_mask=edge_mask)
+        
+        kl_distance_edge = F.kl_div(input=prob_edge.log(), target=limit_dist_edge, reduction='none')
+        kl_distance_edge = kl_distance_edge * edge_mask.unsqueeze(-1)
+        kl_loss = sum_except_batch(kl_distance_edge)
+
+        return kl_loss
     
     
-    def log_pE_given_z0_without_constants(self, E, probE0, node_mask):
+    def log_pE_given_z0_without_constants(self, true_e, pred_e, node_mask):
         # Compute noise values for t = 0.
         bs, n_nodes, _ = node_mask.shape
 
-        probE0 = F.softmax(probE0, dim=-1)
-        probE0 = probE0.view(bs, n_nodes*n_nodes, -1)
-        E = E.view(bs, n_nodes*n_nodes, -1)
-        mask_adj = (E != 0.).any(dim=-1)
-        log_loss = torch.stack([(p_adj[mask, :].log() * t_adj[mask, :]).mean() for (p_adj,t_adj,mask) in zip(probE0, E, mask_adj)])
+        node_mask = node_mask.squeeze()
+        pred_e = F.softmax(pred_e, dim=-1)
+        pred_e[~(node_mask.unsqueeze(1) * node_mask.unsqueeze(2))] = torch.ones(self.num_edge_type).type_as(pred_e)
+
+        diag_mask = torch.eye(pred_e.size(1)).type_as(pred_e).bool()
+        diag_mask = diag_mask.unsqueeze(0).expand(pred_e.size(0), -1, -1)
+        pred_e[diag_mask] = torch.ones(self.num_edge_type).type_as(pred_e)
+        
+        
+        pred_e = pred_e.view(bs, n_nodes*n_nodes, -1)
+        true_e = true_e.view(bs, n_nodes*n_nodes, -1)
+        mask_e = (true_e != 0.).any(dim=-1)
+        log_loss = torch.stack([(p_adj[mask, :].log() * t_adj[mask, :]).sum() for (p_adj,t_adj,mask) in zip(pred_e, true_e, mask_e)])
 
         return log_loss
     
-    
-    def compute_train_adjacency_loss(self, pred, true, bs, n_nodes, alphas):
-        alphas = alphas.squeeze()
-        
-        pred_adj = pred.view(bs, n_nodes*n_nodes, -1)
-        true_adj = true.view(bs, n_nodes*n_nodes, -1)
-        mask_adj = (true_adj != 0.).any(dim=-1)
-        adj_loss = torch.stack([self.edge_bce(p_adj[mask, :], t_adj[mask, :]) for (p_adj,t_adj,mask) in zip(pred_adj, true_adj, mask_adj)])
 
-        return adj_loss
-    
-    
-    
-    def compute_test_adjacency_loss(self, noise_adj, pred_adj, true_adj, bs, n_nodes, alpha_t, alpha_s, sigma_t, edge_mask):
-        pred_probs_adj = F.softmax(pred_adj, dim=-1)
+    def compute_noisy_edge(self, edges, alpha_t, edge_mask, device):
+        Qtb = self.transition_model.get_Qt_bar(alpha_t, device=device)  #(bs, de_in, de_out)
+        assert (abs(Qtb.sum(dim=2) - 1.) < 1e-4).all()
+
+        prob_edges = edges @ Qtb.unsqueeze(1)
+        sampled_edges = diffusion_utils.sample_discrete_features(prob_edges, edge_mask.bool())
+
+        edge_type = F.one_hot(sampled_edges, num_classes=self.num_edge_type)
+        edge_type = edge_type * edge_mask.unsqueeze(-1)
+        
+        return edge_type.to(device)
+        
+        
+    def compute_test_edge_loss(self, noise_e, pred_e, true_e, bs, n_nodes, alpha_t, alpha_s, beta_t, edge_mask):
+        pred_probs_e = F.softmax(pred_e, dim=-1)
 
         Qtb = self.transition_model.get_Qt_bar(alpha_t, edge_mask.device)
         Qsb = self.transition_model.get_Qt_bar(alpha_s, edge_mask.device)
-        Qt = self.transition_model.get_Qt(sigma_t, edge_mask.device)
+        Qt = self.transition_model.get_Qt(beta_t, edge_mask.device)
 
         # Compute distributions to compare with KL
-        prob_true_adj = diffusion_utils.posterior_distributions(E=true_adj, E_t=noise_adj, Qt=Qt, Qsb=Qsb, Qtb=Qtb)
-        prob_true_adj = prob_true_adj.reshape((bs, n_nodes, n_nodes, -1))
+        prob_true_e = diffusion_utils.posterior_distributions(E=true_e, E_t=noise_e, Qt=Qt, Qsb=Qsb, Qtb=Qtb)
+        prob_true_e = prob_true_e.reshape((bs, n_nodes, n_nodes, -1))
         
-        prob_pred_adj = diffusion_utils.posterior_distributions(E=pred_probs_adj, E_t=noise_adj, Qt=Qt, Qsb=Qsb, Qtb=Qtb)
-        prob_pred_adj = prob_pred_adj.reshape((bs, n_nodes, n_nodes, -1))
+        prob_pred_e = diffusion_utils.posterior_distributions(E=pred_probs_e, E_t=noise_e, Qt=Qt, Qsb=Qsb, Qtb=Qtb)
+        prob_pred_e = prob_pred_e.reshape((bs, n_nodes, n_nodes, -1))
 
         # Reshape and filter masked rows
-        prob_true_adj, prob_pred_adj = diffusion_utils.mask_distributions(true_E=prob_true_adj, pred_E=prob_pred_adj, edge_mask=edge_mask.bool())
+        prob_true_e, prob_pred_e = diffusion_utils.mask_distributions(true_E=prob_true_e, pred_E=prob_pred_e, edge_mask=edge_mask.bool())
         
-        kl_distance_E = F.kl_div(input=prob_pred_adj.log(), target=prob_true_adj, reduction='none')
-        kl_loss = mean_except_batch(kl_distance_E)
+        kl_distance_E = F.kl_div(input=prob_pred_e.log(), target=prob_true_e, reduction='none')
+        kl_loss = sum_except_batch(kl_distance_E)
         
         return kl_loss
     
     
-    
-    def phi(self, x, t, node_mask, edge_mask, context, h=None, y=None, adjs=None):
-        net_out = self.dynamics._forward(t, x, node_mask, edge_mask, context, h_2d=h, y_2d=y, adjs=adjs)
+    def compute_train_edge_loss(self, pred_e, true_e, bs, n_nodes):
+        pred_e = pred_e.view(bs, n_nodes*n_nodes, -1)
+        true_e = true_e.view(bs, n_nodes*n_nodes, -1)
+        mask_e = (true_e != 0.).any(dim=-1)
 
-        return net_out
-    
-    
-    def phi_transformer(self, t, x, attn_bias, spatial_pos=None, edge_input=None, edge_type=None, adj=None, node_mask=None, edge_mask=None, context=None):
-        net_out = self.transformer_dynamics.forward(t, x, attn_bias, spatial_pos=spatial_pos, edge_input=edge_input, edge_type=edge_type, adj=adj, node_mask=node_mask, edge_mask=edge_mask, context=context)
+        loss = torch.stack([self.edge_loss(pred[mask, :], torch.argmax(true[mask, :], dim=-1)) for (pred, true, mask) in zip(pred_e, true_e, mask_e)])
 
-        return net_out
+        return loss
     
     
-    def get_pertub_adj(self, alpha_t, adjs, edge_mask, device):
-        Qtb = self.transition_model.get_Qt_bar(alpha_t, device=device)  #(bs, de_in, de_out)
-        prob_adjs = adjs @ Qtb.unsqueeze(1)
-        sampled_adjs = diffusion_utils.sample_discrete_features(prob_adjs, edge_mask.bool())
-
-        edge_type = F.one_hot(sampled_adjs, num_classes=self.num_edge_type)
-        edge_type = edge_type * edge_mask.unsqueeze(-1)
-        
-        return edge_type.to(device)
-
-
-    def compute_loss(self, x, h, adjs, attn_bias, node_mask, edge_mask, context, t0_always):
+    def compute_loss(self, x, h, edges, attn_bias, node_mask, edge_mask, context, t0_always):
         """Computes an estimator for the variational lower bound, or the simple loss (MSE)."""
+
+        bs, n_nodes, dims = x.shape
+        
         # This part is about whether to include loss term 0 always.
         if t0_always:
             # loss_term_0 will be computed separately.
@@ -710,12 +713,12 @@ class EnVariationalDiffusion(torch.nn.Module):
             # estimator = loss_t,           where t ~ U({0, ..., T})
             lowest_t = 0
 
-        bs, n_nodes, dims = x.shape
         # Sample a timestep t.
         t_int = torch.randint(
             lowest_t, self.T + 1, size=(x.size(0), 1), device=x.device).float()
         s_int = t_int - 1
         t_is_zero = (t_int == 0).float()  # Important to compute log p(x | z0).
+
         # Normalize t to [0, 1]. Note that the negative
         # step of s will never be used, since then p(x | z0) is computed.
         s = s_int / self.T
@@ -726,16 +729,13 @@ class EnVariationalDiffusion(torch.nn.Module):
         gamma_t = self.inflate_batch_array(self.gamma(t), x)
 
         # Compute alpha_t and sigma_t from gamma.
+        alpha_s = self.alpha(gamma_s, x)
         alpha_t = self.alpha(gamma_t, x)
         sigma_t = self.sigma(gamma_t, x)
         
-        alpha_s = self.alpha(gamma_s, x)
+        beta_t = self.gamma.get_beta(t)
 
-            
-
-        edge_type = self.get_pertub_adj(alpha_t, adjs, edge_mask, x.device)
-            
-        spatial_pos = diffusion_utils.get_spatial_positions(edge_type, edge_mask, x.device)
+        edges_t = self.compute_noisy_edge(edges, alpha_t, edge_mask, x.device)
         
         
         # Sample zt ~ Normal(alpha_t x, sigma_t)
@@ -748,31 +748,28 @@ class EnVariationalDiffusion(torch.nn.Module):
         z_t = alpha_t * xh + sigma_t * eps
 
         diffusion_utils.assert_mean_zero_with_mask(z_t[:, :, :self.n_dims], node_mask)
-            
-        net_out, pred_adj = self.phi_transformer(t, z_t, attn_bias, spatial_pos=spatial_pos, edge_type=edge_type, 
-                                                 adj=edge_type[:, :, :, 1:].sum(-1).long(), 
-                                                 node_mask=node_mask.view(bs, n_nodes, 1), 
-                                                 edge_mask=edge_mask.view(bs, n_nodes, n_nodes, 1), context=context,
-                                                )
+
+        # Neural net prediction.
+        net_out, edge_out = self.phi(z_t, edges_t, t, attn_bias, node_mask, edge_mask, context)
+        
         
         if self.training:
-            loss_adj = self.compute_train_adjacency_loss(pred_adj, adjs, bs, n_nodes, alpha_t)
+            loss_edge = self.compute_train_edge_loss(edge_out, edges, bs, n_nodes)
             
         else:
-            loss_adj = self.compute_test_adjacency_loss(edge_type, pred_adj, adjs, bs, n_nodes, alpha_t, alpha_s, sigma_t, edge_mask)
-            
-            
-        kl_prior_adj = self.kl_prior_adjacency(adjs, edge_mask.bool())
+            loss_edge = self.compute_test_edge_loss(edges_t, edge_out, edges, bs, n_nodes, alpha_t, alpha_s, beta_t, edge_mask)
+        
+        
+        kl_prior_edge = self.compute_kl_prior_edge(edges, edge_mask.bool())
 
         # Compute the error.
-        error = self.compute_error(net_out, gamma_t, eps)        
+        error = self.compute_error(net_out, gamma_t, eps)
 
         if self.training and self.loss_type == 'l2':
             SNR_weight = torch.ones_like(error)
         else:
             # Compute weighting with SNR: (SNR(s-t) - 1) for epsilon parametrization.
             SNR_weight = (self.SNR(gamma_s - gamma_t) - 1).squeeze(1).squeeze(1)
-            
         assert error.size() == SNR_weight.size()
         loss_t_larger_than_zero = 0.5 * SNR_weight * error
 
@@ -787,117 +784,76 @@ class EnVariationalDiffusion(torch.nn.Module):
         # The KL between q(z1 | x) and p(z1) = Normal(0, 1). Should be close to zero.
         kl_prior = self.kl_prior(xh, node_mask)
 
+        
         # Combining the terms
         if t0_always:
             loss_t = loss_t_larger_than_zero
-            loss_adj_t = loss_adj
             num_terms = self.T  # Since t=0 is not included here.
             estimator_loss_terms = num_terms * loss_t
-            estimator_adj_loss_terms = num_terms * loss_adj_t
+            
+            loss_edge_t = loss_edge
 
             # Compute noise values for t = 0.
             t_zeros = torch.zeros_like(s)
             gamma_0 = self.inflate_batch_array(self.gamma(t_zeros), x)
             alpha_0 = self.alpha(gamma_0, x)
             sigma_0 = self.sigma(gamma_0, x)
+            beta_0 = self.inflate_batch_array(self.gamma.get_beta(t_zeros), x)
+
 
             # Sample z_0 given x, h for timestep t, from q(z_t | x, h)
             eps_0 = self.sample_combined_position_feature_noise(
                 n_samples=x.size(0), n_nodes=x.size(1), node_mask=node_mask)
             z_0 = alpha_0 * xh + sigma_0 * eps_0
-            
-            sigma_0 = self.sigma(gamma_0, target_tensor=edge_mask)
-            Q0 = self.transition_model.get_Qt(beta_t=sigma_0, device=x.device)
-            prob_adjs_0 = adjs @ Q0
-            edge_type_0 = diffusion_utils.sample_discrete_features(prob_adjs_0, edge_mask.bool())
-            edge_type_0 = F.one_hot(edge_type_0, num_classes=self.num_edge_type)
-            edge_type_0 = edge_type_0 * edge_mask.unsqueeze(-1)
-            
-            spatial_pos_0 = diffusion_utils.get_spatial_positions(edge_type_0, edge_mask, x.device)
-            
 
-            net_out_0, pred_adj_0 = self.phi_transformer(t_zeros, z_0, attn_bias, spatial_pos=spatial_pos_0, edge_type=edge_type_0, 
-                                                 adj=edge_type_0[:, :, :, 1:].sum(-1).long(), 
-                                                 node_mask=node_mask.view(bs, n_nodes, 1), 
-                                                 edge_mask=edge_mask.view(bs, n_nodes, n_nodes, 1), context=context,
-                                                )
+            
+            Q0 = self.transition_model.get_Qt(beta_t=beta_0, device=x.device)
+            prob_edges_0 = edges @ Q0
+            edges_0 = diffusion_utils.sample_discrete_features(prob_edges_0, edge_mask.bool())
+            edges_0 = F.one_hot(edges_0, num_classes=self.num_edge_type)
+            edges_0 = edges_0 * edge_mask.unsqueeze(-1)
+            
+            
+            net_out, edge_out = self.phi(z_0, edges_0, t_zeros, attn_bias, node_mask, edge_mask, context)
 
             loss_term_0 = -self.log_pxh_given_z0_without_constants(
-                                    x, h, z_0, gamma_0, eps_0, net_out, node_mask)
+                x, h, z_0, gamma_0, eps_0, net_out, node_mask)
             
-            loss_adj_term_0 = -self.log_pE_given_z0_without_constants(
-                                    adjs, pred_adj_0, node_mask)
+            loss_edge_0 = -self.log_pE_given_z0_without_constants(
+                                    edges, edge_out, node_mask.bool())
+
 
             assert kl_prior.size() == estimator_loss_terms.size()
             assert kl_prior.size() == neg_log_constants.size()
             assert kl_prior.size() == loss_term_0.size()
 
-            loss = kl_prior + estimator_loss_terms + neg_log_constants + loss_term_0 + kl_prior_adj + estimator_adj_loss_terms + loss_adj_term_0
+            loss = kl_prior + estimator_loss_terms + neg_log_constants + loss_term_0 + loss_edge_t + loss_edge_0 + kl_prior_edge
 
         else:
-            # Computes the L_0 term (even if gamma_t is not actually gamma_0)
-            # and this will later be selected via masking.
-            
-            t_zeros = torch.zeros_like(s)
-            gamma_0 = self.inflate_batch_array(self.gamma(t_zeros), x)
-            alpha_0 = self.alpha(gamma_0, x)
-            sigma_0 = self.sigma(gamma_0, x)
 
-            # Sample z_0 given x, h for timestep t, from q(z_t | x, h)
-            eps_0 = self.sample_combined_position_feature_noise(
-                n_samples=x.size(0), n_nodes=x.size(1), node_mask=node_mask)
-            z_0 = alpha_0 * xh + sigma_0 * eps_0
-            
-            sigma_0 = self.sigma(gamma_0, target_tensor=edge_mask)
-            Q0 = self.transition_model.get_Qt(beta_t=sigma_0, device=x.device)
-            prob_adjs_0 = adjs @ Q0
-            edge_type_0 = diffusion_utils.sample_discrete_features(prob_adjs_0, edge_mask.bool())
-            edge_type_0 = F.one_hot(edge_type_0, num_classes=self.num_edge_type)
-            edge_type_0 = edge_type_0 * edge_mask.unsqueeze(-1)
-            
-            spatial_pos_0 = diffusion_utils.get_spatial_positions(edge_type_0, edge_mask, x.device)
-            
-            
-            net_out_0, pred_adj_0 = self.phi_transformer(t_zeros, z_0, attn_bias, spatial_pos=spatial_pos_0, edge_type=edge_type_0, 
-                                                 adj=edge_type_0[:, :, :, 1:].sum(-1).long(), 
-                                                 node_mask=node_mask.view(bs, n_nodes, 1), 
-                                                 edge_mask=edge_mask.view(bs, n_nodes, n_nodes, 1), context=context,
-                                                )
-            
-            loss_term_0 = -self.log_pxh_given_z0_without_constants(
-                                x, h, z_0, gamma_t, eps_0, net_out_0, node_mask)
-            
-            t_is_not_zero = 1 - t_is_zero
-            loss_t = loss_term_0 * t_is_zero.squeeze() + t_is_not_zero.squeeze() * loss_t_larger_than_zero
-            
+            loss_t = loss_t_larger_than_zero
+            loss_edge_t = loss_edge
 
-            loss_adj_term_0 = -self.log_pE_given_z0_without_constants(
-                                    adjs, pred_adj_0, node_mask)
             
-            loss_adj_t = loss_adj_term_0 * t_is_zero.squeeze() + t_is_not_zero.squeeze() * loss_adj
-                
-
-
             # Only upweigh estimator if using the vlb objective.
             if self.training and self.loss_type == 'l2':
                 estimator_loss_terms = loss_t
-                estimator_adj_loss_terms = loss_adj_t
             else:
                 num_terms = self.T + 1  # Includes t = 0.
                 estimator_loss_terms = num_terms * loss_t
 
             assert kl_prior.size() == estimator_loss_terms.size()
             assert kl_prior.size() == neg_log_constants.size()
-            
-            loss = kl_prior + estimator_loss_terms + neg_log_constants + kl_prior_adj + estimator_adj_loss_terms
+
+            loss = kl_prior + estimator_loss_terms + neg_log_constants +  loss_edge_t + kl_prior_edge 
 
         assert len(loss.shape) == 1, f'{loss.shape} has more than only batch dim.'
 
-        return loss, {'t': t_int.squeeze(), 'loss_t': loss.squeeze(),
-                      'error': error.squeeze()}
+        return loss, {'t': t_int.squeeze(), 'loss_t': loss_t.squeeze(), 'kl_prior': kl_prior.squeeze(),
+                      'error': error.squeeze(), 'loss_edge_t': loss_edge_t.squeeze(), 'kl_prior_edge': kl_prior_edge.squeeze()}
 
     
-    def forward(self, x, h, adjs, attn_bias, node_mask=None, edge_mask=None, context=None):
+    def forward(self, x, h, edges, attn_bias, node_mask=None, edge_mask=None, context=None):
         """
         Computes the loss (type l2 or NLL) if training. And if eval then always computes NLL.
         """
@@ -907,53 +863,55 @@ class EnVariationalDiffusion(torch.nn.Module):
         # Reset delta_log_px if not vlb objective.
         if self.training and self.loss_type == 'l2':
             delta_log_px = torch.zeros_like(delta_log_px)
-            
+
         if self.training:
             # Only 1 forward pass when t0_always is False.
-            loss, loss_dict = self.compute_loss(x, h, adjs, attn_bias, node_mask, edge_mask, context, t0_always=False)
+            loss, loss_dict = self.compute_loss(x, h, edges, attn_bias, node_mask, edge_mask, context, t0_always=False)
         else:
             # Less variance in the estimator, costs two forward passes.
-            loss, loss_dict = self.compute_loss(x, h, adjs, attn_bias, node_mask, edge_mask, context, t0_always=True)
+            loss, loss_dict = self.compute_loss(x, h, edges, attn_bias, node_mask, edge_mask, context, t0_always=True)
 
-        neg_log_pxhe = loss
+        neg_log_pxh = loss
 
         # Correct for normalization on x.
-        assert neg_log_pxhe.size() == delta_log_px.size()
-        neg_log_pxhe = neg_log_pxhe - delta_log_px
+        assert neg_log_pxh.size() == delta_log_px.size()
+        neg_log_pxh = neg_log_pxh - delta_log_px
 
-        return neg_log_pxhe
+        return neg_log_pxh, loss_dict
 
-    def sample_p_zs_given_zt(self, s, t, zt, adj, attn_bias, node_mask, edge_mask, context, fix_noise=False):
+    
+    def sample_p_zs_given_zt(self, s, t, zt, edges, attn_bias, node_mask, edge_mask, context, fix_noise=False):
         """Samples from zs ~ p(zs | zt). Only used during sampling."""
         
         bs, n_nodes, _ = node_mask.shape
         gamma_s = self.gamma(s)
         gamma_t = self.gamma(t)
+        beta_t = self.inflate_batch_array(self.gamma.get_beta(t), zt)
 
         sigma2_t_given_s, sigma_t_given_s, alpha_t_given_s = \
             self.sigma_and_alpha_t_given_s(gamma_t, gamma_s, zt)
 
-        sigma_s = self.sigma(gamma_s, target_tensor=zt)
-        sigma_t = self.sigma(gamma_t, target_tensor=zt)
         
         alpha_s = self.alpha(gamma_s, zt)
         alpha_t = self.alpha(gamma_t, zt)
         
+        sigma_s = self.sigma(gamma_s, target_tensor=zt)
+        sigma_t = self.sigma(gamma_t, target_tensor=zt)
+
+        
+        # Retrieve transitions matrix
         Qtb = self.transition_model.get_Qt_bar(alpha_t, device=zt.device)
         Qsb = self.transition_model.get_Qt_bar(alpha_s, device=zt.device)
-        Qt = self.transition_model.get_Qt(sigma_t.squeeze(1), device=zt.device)
-                
-        spatial_pos = diffusion_utils.get_spatial_positions(adj, edge_mask.squeeze(), zt.device)
+        Qt = self.transition_model.get_Qt(beta_t.squeeze(1), device=zt.device)
         
-        # Neural net prediction
-        eps_t, pred_adj = self.phi_transformer(t, zt, attn_bias, spatial_pos=spatial_pos, edge_type=adj, 
-                                                 adj=adj[:, :, :, 1:].sum(-1).long(), 
-                                                 node_mask=node_mask, edge_mask=edge_mask, context=context,
-                                                )
+        
+        # Neural net prediction.
+        eps_t, edge_out = self.phi(zt, edges, t, attn_bias, node_mask, edge_mask, context)
 
         # Compute mu for p(zs | zt).
-        diffusion_utils.assert_mean_zero_with_mask(zt[:, :, :self.n_dims], node_mask)
-        diffusion_utils.assert_mean_zero_with_mask(eps_t[:, :, :self.n_dims], node_mask)
+        #diffusion_utils.assert_mean_zero_with_mask(zt[:, :, :self.n_dims], node_mask)
+        #diffusion_utils.assert_mean_zero_with_mask(eps_t[:, :, :self.n_dims], node_mask)
+        
         mu = zt / alpha_t_given_s - (sigma2_t_given_s / alpha_t_given_s / sigma_t) * eps_t
 
         # Compute sigma for p(zs | zt).
@@ -964,27 +922,29 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         # Project down to avoid numerical runaway of the center of gravity.
         zs = torch.cat(
-            [diffusion_utils.remove_mean_with_mask(zs[:, :, :self.n_dims], node_mask),
-             zs[:, :, self.n_dims:]], dim=2)
+            [diffusion_utils.remove_mean_with_mask(zs[:, :, :self.n_dims],
+                                                   node_mask),
+             zs[:, :, self.n_dims:]], dim=2
+        )
+        
+        pred_edge = F.softmax(edge_out, dim=-1) 
+        p_s_and_t_given_edge_0 = diffusion_utils.compute_batched_over0_posterior_distribution(X_t=edges, Qt=Qt, Qsb=Qsb, Qtb=Qtb)
+        pred_edge = pred_edge.reshape((bs, -1, pred_edge.shape[-1]))
+        weighted_edge = pred_edge.unsqueeze(-1) * p_s_and_t_given_edge_0        # bs, N, d0, d_t-1
+        unnormalized_prob_edge = weighted_edge.sum(dim=-2)
+        unnormalized_prob_edge[torch.sum(unnormalized_prob_edge, dim=-1) == 0] = 1e-5
+        
+        prob_edge = unnormalized_prob_edge / torch.sum(unnormalized_prob_edge, dim=-1, keepdim=True)
+        prob_edge = prob_edge.reshape(bs, n_nodes, n_nodes, self.num_edge_type)
+        
+        discrete_edge = diffusion_utils.sample_discrete_features(prob_edge, edge_mask.squeeze(-1).bool())
+        
+        edge_s = F.one_hot(discrete_edge, num_classes=self.num_edge_type).float() * edge_mask
         
         
-        # Compute adj
-        pred_adj = F.softmax(pred_adj, dim=-1) 
-        p_s_and_t_given_0_E = diffusion_utils.compute_batched_over0_posterior_distribution(X_t=pred_adj, Qt=Qt, Qsb=Qsb, Qtb=Qtb)
-        
-        pred_adj = pred_adj.reshape((bs, -1, pred_adj.shape[-1]))
-        weighted_adj = pred_adj.unsqueeze(-1) * p_s_and_t_given_0_E        # bs, N, d0, d_t-1
-        unnormalized_prob_adj = weighted_adj.sum(dim=-2)
-        unnormalized_prob_adj[torch.sum(unnormalized_prob_adj, dim=-1) == 0] = 1e-5
-        
-        prob_adj = unnormalized_prob_adj / torch.sum(unnormalized_prob_adj, dim=-1, keepdim=True)
-        prob_adj = prob_adj.reshape(bs, n_nodes, n_nodes, self.num_edge_type)
-        
-        discrete_adj = diffusion_utils.sample_discrete_features(prob_adj, edge_mask.squeeze(-1).bool())
-        discrete_adj = F.one_hot(discrete_adj, num_classes=self.num_edge_type).float()
-        
-        return zs, discrete_adj
+        return zs, edge_s
 
+    
     def sample_combined_position_feature_noise(self, n_samples, n_nodes, node_mask):
         """
         Samples mean-centered normal noise for z_x, and standard normal noise for z_h.
@@ -997,11 +957,13 @@ class EnVariationalDiffusion(torch.nn.Module):
             node_mask=node_mask)
         z = torch.cat([z_x, z_h], dim=2)
         return z
+
     
     
-    def sample_adjacency_noise(self, n_samples, n_nodes, edge_mask):
+    def sample_random_edge(self, n_samples, n_nodes, edge_mask):
+        bs, n_max, _, _ = edge_mask.shape
         e_limit = self.e_limit[None, None, None, :].expand(n_samples, n_nodes, n_nodes, -1)
-        U_E = e_limit.flatten(end_dim=-2).multinomial(1)
+        U_E = e_limit.flatten(end_dim=-2).multinomial(1).reshape(bs, n_max, n_max)
         U_E = F.one_hot(U_E, num_classes=self.num_edge_type)
         U_E = U_E.reshape(n_samples, n_nodes, n_nodes, self.num_edge_type).type_as(edge_mask)
                 
@@ -1017,7 +979,8 @@ class EnVariationalDiffusion(torch.nn.Module):
         U_E = U_E * edge_mask
         return U_E
     
-
+    
+    
     @torch.no_grad()
     def sample(self, n_samples, n_nodes, node_mask, edge_mask, context, fix_noise=False):
         """
@@ -1026,14 +989,15 @@ class EnVariationalDiffusion(torch.nn.Module):
         if fix_noise:
             # Noise is broadcasted over the batch axis, useful for visualizations.
             z = self.sample_combined_position_feature_noise(1, n_nodes, node_mask)
-            adj = self.sample_adjacency_noise(1, n_nodes, edge_mask).to(z.device)
-            attn_bias = torch.zeros([1, n_nodes+1, n_nodes+1]).float().to(z.device)
+            edges = self.sample_random_edge(1, n_nodes, edge_mask)
+            attn_bias = torch.zeros(1, n_nodes+1, n_nodes+1)
+            
         else:
             z = self.sample_combined_position_feature_noise(n_samples, n_nodes, node_mask)
-            adj = self.sample_adjacency_noise(n_samples, n_nodes, edge_mask).to(z.device)
-            attn_bias = torch.zeros([n_samples, n_nodes+1, n_nodes+1]).float().to(z.device)
-
-        diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
+            edges = self.sample_random_edge(n_samples, n_nodes, edge_mask)
+            attn_bias = torch.zeros(n_samples, n_nodes+1, n_nodes+1)
+        
+        #diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
 
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
         for s in reversed(range(0, self.T)):
@@ -1042,16 +1006,12 @@ class EnVariationalDiffusion(torch.nn.Module):
             s_array = s_array / self.T
             t_array = t_array / self.T
 
-            z, adj = self.sample_p_zs_given_zt(
-                s_array, t_array, z, adj, attn_bias, node_mask, edge_mask, context, fix_noise=fix_noise)
-            
-            #z = self.sample_p_zs_given_zt(s_array, t_array, z, node_mask, edge_mask, context, fix_noise=fix_noise)
+            z, edges = self.sample_p_zs_given_zt(s_array, t_array, z, edges, attn_bias, node_mask, edge_mask, context, fix_noise=fix_noise)
 
         # Finally sample p(x, h | z_0).
-        #x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context, fix_noise=fix_noise)
-        x, h, predicted_graph = self.sample_p_xh_given_z0(z, adj, attn_bias, node_mask, edge_mask, context, fix_noise=fix_noise)
+        x, h, graph = self.sample_p_xh_given_z0(z, edges, attn_bias, node_mask, edge_mask, context, fix_noise=fix_noise)
 
-        diffusion_utils.assert_mean_zero_with_mask(x, node_mask)
+        #diffusion_utils.assert_mean_zero_with_mask(x, node_mask)
 
         max_cog = torch.sum(x, dim=1, keepdim=True).abs().max().item()
         if max_cog > 5e-2:
@@ -1059,29 +1019,28 @@ class EnVariationalDiffusion(torch.nn.Module):
                   f'the positions down.')
             x = diffusion_utils.remove_mean_with_mask(x, node_mask)
 
-        return x, h, predicted_graph
+        return x, h, graph
 
-        
-        
+    
     @torch.no_grad()
     def sample_chain(self, n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=None):
         """
         Draw samples from the generative model, keep the intermediate states for visualization purposes.
         """
-        
         edge_mask = edge_mask.view(n_samples, n_nodes, n_nodes, 1)
         z = self.sample_combined_position_feature_noise(n_samples, n_nodes, node_mask)
-        adj = self.sample_adjacency_noise(n_samples, n_nodes, edge_mask).to(z.device)
-        attn_bias = torch.zeros([n_samples, n_nodes+1, n_nodes+1]).float().to(z.device)
-        
+        edges = self.sample_random_edge(n_samples, n_nodes, edge_mask)
+        attn_bias = torch.zeros(n_samples, n_nodes+1, n_nodes+1)
+
         diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
 
         if keep_frames is None:
             keep_frames = self.T
         else:
             assert keep_frames <= self.T
+            
         chain = torch.zeros((keep_frames,) + z.size(), device=z.device)
-        chain_adj = torch.zeros((keep_frames,) + adj.size(), device=z.device)
+        chain_edge = torch.zeros((keep_frames,) + edges.size(), device=z.device)
 
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
         for s in reversed(range(0, self.T)):
@@ -1090,29 +1049,29 @@ class EnVariationalDiffusion(torch.nn.Module):
             s_array = s_array / self.T
             t_array = t_array / self.T
 
-            z, adj = self.sample_p_zs_given_zt(
-                s_array, t_array, z, adj, attn_bias, node_mask, edge_mask, context)
+            z, edges = self.sample_p_zs_given_zt(
+                s_array, t_array, z, edges, attn_bias, node_mask, edge_mask, context)
 
             diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
 
             # Write to chain tensor.
             write_index = (s * keep_frames) // self.T
             chain[write_index] = self.unnormalize_z(z, node_mask)
-            chain_adj[write_index] = adj
+            chain_edge[write_index] = edges
 
         # Finally sample p(x, h | z_0).
-        x, h, predicted_graph = self.sample_p_xh_given_z0(z, adj, attn_bias, node_mask, edge_mask, context)
+        x, h, graph = self.sample_p_xh_given_z0(z, edges, attn_bias, node_mask, edge_mask, context)
 
         diffusion_utils.assert_mean_zero_with_mask(x[:, :, :self.n_dims], node_mask)
 
         xh = torch.cat([x, h['categorical'], h['integer']], dim=2)
         chain[0] = xh  # Overwrite last frame with the resulting x and h.
-        chain_adj[0] = predicted_graph
+        chain_edge[0] = graph
 
         chain_flat = chain.view(n_samples * keep_frames, *z.size()[1:])
-        chain_adj_flat = chain_adj.view(n_samples * keep_frames, *adj.size()[1:])
+        chain_edge_flat = chain_edge.view(n_samples * keep_frames, *edges.size()[1:])
 
-        return chain_flat, chain_adj_flat
+        return chain_flat, chain_edge_flat
 
     def log_info(self):
         """
