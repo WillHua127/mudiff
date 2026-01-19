@@ -155,14 +155,18 @@ def get_optim(args, generative_model):
 
 class DistributionNodes:
     def __init__(self, histogram):
-
+        # histogram is a list where histogram[i] is the count of molecules with i nodes.
         self.n_nodes = []
         prob = []
         self.keys = {}
-        for i, nodes in enumerate(histogram):
-            self.n_nodes.append(nodes)
-            self.keys[nodes] = i
-            prob.append(histogram[nodes])
+        for i, count in enumerate(histogram):
+            if count > 0:
+                self.n_nodes.append(i)
+                prob.append(count)
+
+        for i, n in enumerate(self.n_nodes):
+            self.keys[n] = i
+
         self.n_nodes = torch.tensor(self.n_nodes)
         prob = np.array(prob)
         prob = prob/np.sum(prob)
